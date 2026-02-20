@@ -1,0 +1,22 @@
+services:
+  ragent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - CLAUDE_BASE_URL=${CLAUDE_BASE_URL}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      - AUTH_USERNAME=${AUTH_USERNAME}
+      - AUTH_PASSWORD=${AUTH_PASSWORD}
+      - TMUX_SESSION_NAME=${TMUX_SESSION_NAME}
+    volumes:
+      - ragent_workspace:/workspace
+    restart: unless-stopped
+    container_name: ragent
+
+volumes:
+  ragent_workspace:
+    driver: local

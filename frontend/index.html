@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Ragent</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <link rel="stylesheet" href="styles/preview.css" />
+    <style>
+        :root {
+            --header-height: 60px;
+            --terminal-padding: 10px;
+            --safe-area-top: env(safe-area-inset-top, 0px);
+            --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+            --safe-area-left: env(safe-area-inset-left, 0px);
+            --safe-area-right: env(safe-area-inset-right, 0px);
+        }
+
+        *, *::before, *::after { box-sizing: border-box; }
+
+        html { overflow: hidden; width: 100%; height: 100%; }
+
+        body {
+            margin: 0; padding: 0;
+            padding-top: var(--safe-area-top);
+            padding-left: var(--safe-area-left);
+            padding-right: var(--safe-area-right);
+            background-color: #1e1e1e;
+            font-family: 'Courier New', monospace;
+            overflow: hidden; width: 100%; height: 100%;
+            overscroll-behavior: contain;
+        }
+
+        .header {
+            background-color: #2d2d30; color: #cccccc;
+            padding: 10px 20px; height: var(--header-height);
+            border-bottom: 1px solid #3e3e42;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+
+        .header h1 { margin: 0; font-size: 18px; font-weight: normal; }
+        .status { font-size: 12px; color: #4ec9b0; }
+
+        .main-container {
+            display: flex; flex-direction: column;
+            width: 100%; max-width: 100vw; overflow: hidden;
+            height: calc(100vh - var(--header-height) - var(--safe-area-top));
+            height: calc(100dvh - var(--header-height) - var(--safe-area-top));
+        }
+
+        .terminal-container {
+            flex: 1; min-height: 0; position: relative;
+            overflow: hidden; max-width: 100vw;
+        }
+
+        #terminal { position: absolute; inset: var(--terminal-padding); overflow: hidden; }
+
+        #terminal .xterm-viewport {
+            -webkit-overflow-scrolling: touch; touch-action: pan-y;
+        }
+
+        #terminal .xterm-helper-textarea {
+            min-width: 1px !important; min-height: 1px !important; padding: 1px !important;
+        }
+
+        .connecting {
+            display: flex; justify-content: center; align-items: center;
+            height: 100%; color: #cccccc; font-size: 16px;
+        }
+
+        @media (max-width: 768px) {
+            :root { --header-height: 50px; --terminal-padding: 6px; }
+            .header { padding: 8px 12px; }
+            .header h1 { font-size: 16px; }
+            .status { font-size: 11px; }
+        }
+
+        @media (max-width: 480px) {
+            :root { --header-height: 44px; --terminal-padding: 4px; }
+            .header { padding: 6px 10px; }
+            .header h1 { font-size: 14px; }
+            .status { font-size: 10px; }
+        }
+
+        /* Virtual Keyboard Toolbar */
+        .virtual-keys {
+            display: flex; background-color: #2d2d30;
+            border-top: 1px solid #3e3e42;
+            padding: 10px 6px 50px 6px; gap: 6px;
+            flex-wrap: nowrap; flex-shrink: 0;
+            justify-content: center; align-items: center;
+            margin-bottom: env(safe-area-inset-bottom, 0px);
+            overflow-x: auto; overflow-y: visible;
+            width: 100%; max-width: 100vw;
+        }
+
+        .vkey {
+            background-color: #3e3e42; color: #cccccc;
+            border: 1px solid #555; border-radius: 8px;
+            padding: 12px 0; font-size: 13px;
+            font-family: 'Courier New', monospace;
+            cursor: pointer; touch-action: manipulation;
+            user-select: none; -webkit-user-select: none;
+            min-width: 0; flex: 1 1 auto; max-width: 60px;
+            text-align: center;
+        }
+        .vkey:active { background-color: #4ec9b0; color: #1e1e1e; }
+
+        .vkey-arrow-panel {
+            display: none; position: fixed;
+            background-color: #2d2d30; border: 1px solid #555;
+            border-radius: 8px; padding: 8px;
+            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3); z-index: 1000;
+        }
+        .vkey-arrow-panel.open { display: block; }
+
+        .vkey-dpad {
+            display: grid; grid-template-columns: repeat(3, 40px);
+            grid-template-rows: repeat(2, 36px); gap: 4px;
+        }
+        .vkey-dpad .vkey {
+            padding: 0; font-size: 14px; max-width: none; flex: none;
+            border-radius: 6px; display: flex; align-items: center; justify-content: center;
+        }
+        .vkey-dpad .dpad-up { grid-column: 2; grid-row: 1; }
+        .vkey-dpad .dpad-left { grid-column: 1; grid-row: 2; }
+        .vkey-dpad .dpad-down { grid-column: 2; grid-row: 2; }
+        .vkey-dpad .dpad-right { grid-column: 3; grid-row: 2; }
+
+        .vkey-menu-wrapper {
+            position: relative; flex: 1 1 auto; max-width: 70px; min-width: 0;
+        }
+        .vkey-menu-wrapper .vkey { width: 100%; max-width: none; }
+
+        .vkey-menu {
+            display: none; position: fixed; background-color: #2d2d30;
+            border: 1px solid #555; border-radius: 8px; min-width: 160px;
+            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3); z-index: 1000; overflow: hidden;
+        }
+        .vkey-menu.open { display: block; }
+
+        .vkey-menu-item {
+            padding: 12px 16px; color: #cccccc; font-size: 14px;
+            cursor: pointer; display: flex; align-items: center; gap: 8px;
+        }
+        .vkey-menu-item:hover, .vkey-menu-item:active { background-color: #3e3e42; }
+        .vkey-menu-item.active { background-color: #4ec9b0; color: #1e1e1e; }
+        .vkey-menu-item.disabled { color: #666; cursor: default; }
+        .vkey-menu-divider { height: 1px; background-color: #555; margin: 4px 0; }
+        .vkey-menu-windows { max-height: 200px; overflow-y: auto; }
+        .vkey-menu-section {
+            padding: 8px 16px 4px; color: #888; font-size: 11px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .pane-count { color: #4ec9b0; font-size: 12px; margin-left: 4px; }
+
+        .toast {
+            position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+            background-color: #f44747; color: white; padding: 12px 24px;
+            border-radius: 8px; font-size: 14px; z-index: 2000;
+            opacity: 0; transition: opacity 0.3s ease; pointer-events: none;
+        }
+        .toast.visible { opacity: 1; }
+
+        .selection-overlay {
+            display: none; position: fixed; inset: 0; z-index: 1000;
+            background-color: #1e1e1e; flex-direction: column;
+        }
+        .selection-overlay.open { display: flex; }
+        .selection-overlay-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 10px 16px; background-color: #2d2d30;
+            border-bottom: 1px solid #3e3e42; color: #cccccc; font-size: 14px; flex-shrink: 0;
+        }
+        .selection-overlay-actions { display: flex; gap: 8px; }
+        .selection-btn {
+            background-color: #0e639c; color: #fff; border: none;
+            border-radius: 4px; padding: 6px 12px; font-size: 13px; cursor: pointer;
+        }
+        .selection-btn:active { background-color: #1177bb; }
+        .selection-btn.selection-close { background-color: #555; }
+        .selection-content {
+            flex: 1; overflow: auto; padding: 12px;
+            font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+            font-size: 13px; line-height: 1.4; color: #cccccc;
+            white-space: pre; -webkit-user-select: text; user-select: text;
+            -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Ragent</h1>
+        <div class="status" id="status">Connecting...</div>
+    </div>
+
+    <div class="main-container">
+        <div class="terminal-container">
+            <div id="terminal"></div>
+            <div id="connecting" class="connecting" style="display: none;">
+                Connecting to terminal...
+            </div>
+        </div>
+
+        <div class="virtual-keys" id="virtual-keys">
+            <button class="vkey" data-key="Escape">ESC</button>
+            <button class="vkey" data-key="Tab">TAB</button>
+            <button class="vkey" data-key="ShiftTab">S+Tab</button>
+            <button class="vkey" data-ctrl="c">^C</button>
+            <button class="vkey" data-action="select" title="Select text">Select</button>
+            <button class="vkey" data-action="paste" title="Paste clipboard">Paste</button>
+        <div class="vkey-menu-wrapper">
+            <button class="vkey" id="window-menu-btn">Win</button>
+            <div class="vkey-menu" id="window-menu">
+                <div class="vkey-menu-section">Windows</div>
+                <div class="vkey-menu-item" data-action="new-window">+ New Window</div>
+                <div class="vkey-menu-item" data-action="rename-window">Rename</div>
+                <div class="vkey-menu-item disabled" data-action="close-window" id="close-window-btn">Close Window</div>
+                <div class="vkey-menu-windows" id="window-list">
+                    <div class="vkey-menu-item disabled">Loading...</div>
+                </div>
+                <div class="vkey-menu-divider"></div>
+                <div class="vkey-menu-section">Panes <span class="pane-count" id="pane-count">[1 pane]</span></div>
+                <div class="vkey-menu-item" data-action="split-h" id="split-h-btn">Horizontal Split</div>
+                <div class="vkey-menu-item" data-action="split-v" id="split-v-btn">Vertical Split</div>
+                <div class="vkey-menu-item disabled" data-action="switch-pane" id="switch-pane-btn">Switch Pane</div>
+                <div class="vkey-menu-item disabled" data-action="close-pane" id="close-pane-btn">Close Pane</div>
+            </div>
+        </div>
+        <div class="vkey-menu-wrapper">
+            <button class="vkey" id="arrow-menu-btn">Arrows</button>
+            <div class="vkey-arrow-panel" id="arrow-panel">
+                <div class="vkey-dpad">
+                    <button class="vkey dpad-up" data-key="ArrowUp">^</button>
+                    <button class="vkey dpad-left" data-key="ArrowLeft"><</button>
+                    <button class="vkey dpad-down" data-key="ArrowDown">v</button>
+                    <button class="vkey dpad-right" data-key="ArrowRight">></button>
+                </div>
+            </div>
+        </div>
+    </div>
+    </div>
+
+    <div class="selection-overlay" id="selection-overlay" role="dialog" aria-modal="true" aria-label="Select text">
+        <div class="selection-overlay-header">
+            <span>Select text and click Copy</span>
+            <div class="selection-overlay-actions">
+                <button class="selection-btn" id="selection-copy-btn">Copy</button>
+                <button class="selection-btn" id="selection-all-btn">Select All</button>
+                <button class="selection-btn selection-close" id="selection-close-btn">Close</button>
+            </div>
+        </div>
+        <div class="selection-content" id="selection-content"></div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-unicode11@0.6.0/lib/xterm-addon-unicode11.js"></script>
+    <script src="app.js"></script>
+    <script src="components/PreviewPanel.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "ragent",
+  "version": "1.0.0",
+  "description": "Your remote agent in the digital world — Claude Code accessible from any browser",
+  "main": "server.js",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-basic-auth": "^1.2.1",
+    "http-proxy-middleware": "^2.0.6",
+    "node-pty": "^1.0.0",
+    "ws": "^8.14.2"
+  },
+  "license": "MIT"
+}
