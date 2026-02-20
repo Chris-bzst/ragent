@@ -36,7 +36,7 @@ EOF
 
     echo "Claude Code ready with API Key authentication"
 else
-    echo "No API Key provided - you'll need to set CLAUDE_API_KEY"
+    echo "No API Key provided - run 'claude' in the terminal and log in via OAuth"
 fi
 
 # Create user workspace directory

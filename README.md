@@ -2,6 +2,8 @@
 
 Your remote agent in the digital world. Ragent gives you a full web terminal connected to Claude Code CLI running inside a Docker container — accessible from any browser, on any device.
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/4Sz1He?referralCode=_dSteA&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
 ## Quick Start
 
 ```bash
@@ -28,7 +30,7 @@ Set these in your `.env` file:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CLAUDE_API_KEY` | Yes | Your Anthropic API key |
+| `CLAUDE_API_KEY` | No | Your Anthropic API key. If not set, run `claude` in the terminal and log in via OAuth |
 | `CLAUDE_BASE_URL` | No | Custom API endpoint (proxy, regional) |
 | `AUTH_USERNAME` | No | HTTP Basic Auth username |
 | `AUTH_PASSWORD` | No | HTTP Basic Auth password |
@@ -46,6 +48,12 @@ Set these in your `.env` file:
 - **Persistent Storage** - `/workspace` volume keeps your files across restarts
 
 ## Cloud Deployment
+
+### One-Click Deploy to Railway
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/4Sz1He?referralCode=_dSteA&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
+### Docker
 
 Works on any platform that supports Docker:
 
