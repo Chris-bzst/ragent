@@ -51,9 +51,10 @@
         .terminal-container {
             flex: 1; min-height: 0; position: relative;
             overflow: hidden; max-width: 100vw;
+            display: flex; flex-direction: column;
         }
 
-        #terminal { position: absolute; inset: var(--terminal-padding); overflow: hidden; }
+        #terminal { flex: 1; min-height: 0; padding: var(--terminal-padding); overflow: hidden; position: relative; }
 
         #terminal .xterm-viewport {
             -webkit-overflow-scrolling: touch; touch-action: pan-y;
@@ -200,7 +201,6 @@
             <div id="connecting" class="connecting" style="display: none;">
                 Connecting to terminal...
             </div>
-        </div>
 
         <div class="virtual-keys" id="virtual-keys">
             <button class="vkey" data-key="Escape">ESC</button>
@@ -238,7 +238,8 @@
                 </div>
             </div>
         </div>
-    </div>
+        </div>
+        </div>
     </div>
 
     <div class="selection-overlay" id="selection-overlay" role="dialog" aria-modal="true" aria-label="Select text">

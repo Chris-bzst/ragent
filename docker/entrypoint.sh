@@ -3,6 +3,13 @@
 # Runtime configuration for Claude Code
 echo "Configuring Claude Code at runtime..."
 
+# Always ensure /workspace/.local/bin is in PATH for all shell sessions
+cat >> /etc/bash.bashrc << 'EOF'
+
+# Workspace bin path (always set)
+export PATH="/workspace/.local/bin:$PATH"
+EOF
+
 # Check if API Key is provided
 if [ ! -z "$CLAUDE_API_KEY" ]; then
     echo "API Key provided, setting up authentication..."
@@ -24,14 +31,13 @@ export PATH="/workspace/.local/bin:\$PATH"
 EOF
     chmod +x /etc/profile.d/claude-env.sh
 
-    # Also add to /etc/bash.bashrc for non-login shells (used by PTY)
+    # Also add API credentials to /etc/bash.bashrc for non-login shells (used by PTY)
     cat >> /etc/bash.bashrc << EOF
 
 # Claude Code API credentials (auto-configured)
 export ANTHROPIC_AUTH_TOKEN="${CLAUDE_API_KEY}"
 export ANTHROPIC_API_KEY="${CLAUDE_API_KEY}"
 export ANTHROPIC_BASE_URL="${CLAUDE_BASE_URL}"
-export PATH="/workspace/.local/bin:\$PATH"
 EOF
 
     echo "Claude Code ready with API Key authentication"

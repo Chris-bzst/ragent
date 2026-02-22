@@ -310,12 +310,18 @@ app.use('/preview/:port', (req, res, next) => {
   const proxy = createProxyMiddleware({
     target: `http://localhost:${port}`,
     changeOrigin: true,
-    ws: true,
     pathRewrite: (path) => path.replace(new RegExp(`^/preview/${port}`), ''),
     onError: (err, req, res) => {
-      if (!res.headersSent) {
-        res.status(502).json({ error: 'Bad Gateway', message: 'Unable to connect to the development server', port });
+      if (res && typeof res.status === 'function') {
+        if (!res.headersSent) {
+          res.status(502).json({ error: 'Bad Gateway', message: 'Unable to connect to the development server', port });
+        }
+      } else if (res && typeof res.end === 'function') {
+        try { res.end(); } catch (_) {}
       }
+    },
+    onProxyReq: (proxyReq) => {
+      proxyReq.removeHeader('accept-encoding');
     },
     onProxyRes: (proxyRes, req, res) => {
       const contentType = proxyRes.headers['content-type'] || '';
@@ -324,6 +330,7 @@ app.use('/preview/:port', (req, res, next) => {
         const _end = res.end;
         let body = '';
         delete proxyRes.headers['content-length'];
+        delete proxyRes.headers['content-encoding'];
 
         res.write = function(chunk) { body += chunk.toString(); };
         res.end = function(chunk) {
