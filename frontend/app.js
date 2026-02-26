@@ -281,7 +281,7 @@ class WebClaudeCode {
         });
 
         document.addEventListener('click', (e) => {
-            if (this.terminal && !e.target.closest('.virtual-keys') && !e.target.closest('.selection-overlay')) {
+            if (this.terminal && !e.target.closest('[role="dialog"]') && !e.target.closest('.virtual-keys')) {
                 if (!this.terminal.hasSelection()) this.terminal.focus();
             }
         });
@@ -581,9 +581,10 @@ class WebClaudeCode {
         if (!overlay || !textarea) return;
         textarea.value = '';
         overlay.classList.add('open');
-        // Delay focus so the overlay renders first — Safari's native paste popup
-        // will appear near the textarea instead of near the Paste button.
-        setTimeout(() => textarea.focus(), 100);
+        // Focus immediately — must be synchronous within the user gesture (click)
+        // so that mobile Safari allows the focus. Safari's native paste popup
+        // will appear near the textarea, which is fine.
+        textarea.focus();
         this._pasteOverlayTimer = setTimeout(() => this.closePasteOverlay(), 30000);
     }
 
