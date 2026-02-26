@@ -10,6 +10,7 @@ class WebClaudeCode {
         this.pingInterval = null;
         this.isUploadingImage = false;
         this.toastTimer = null;
+        this._pasteOverlayTimer = null;
 
         this.init();
     }
@@ -29,6 +30,7 @@ class WebClaudeCode {
         this.setupEventListeners();
         this.setupVirtualKeys();
         this.setupSelectionOverlay();
+        this.setupPasteOverlay();
         this.setupImagePaste();
     }
 
@@ -324,10 +326,12 @@ class WebClaudeCode {
                         if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
                             this.socket.send(JSON.stringify({ type: 'input', data: text }));
                             this.showToast('Pasted');
+                        } else {
+                            this.openPasteOverlay();
                         }
-                    }).catch(() => { this.showToast('Paste failed, check clipboard permissions'); });
+                    }).catch(() => { this.openPasteOverlay(); });
                 } else {
-                    this.showToast('Paste not supported in this environment');
+                    this.openPasteOverlay();
                 }
                 return;
             } else if (button.dataset.key) {
@@ -582,6 +586,54 @@ class WebClaudeCode {
         });
     }
 
+    openPasteOverlay() {
+        const overlay = document.getElementById('paste-overlay');
+        const textarea = document.getElementById('paste-overlay-textarea');
+        if (!overlay || !textarea) return;
+        textarea.value = '';
+        overlay.classList.add('open');
+        textarea.focus();
+        // Auto-dismiss after 30 seconds
+        this._pasteOverlayTimer = setTimeout(() => this.closePasteOverlay(), 30000);
+    }
+
+    closePasteOverlay() {
+        const overlay = document.getElementById('paste-overlay');
+        if (overlay) overlay.classList.remove('open');
+        if (this._pasteOverlayTimer) {
+            clearTimeout(this._pasteOverlayTimer);
+            this._pasteOverlayTimer = null;
+        }
+        if (this.terminal) this.terminal.focus();
+    }
+
+    setupPasteOverlay() {
+        const overlay = document.getElementById('paste-overlay');
+        const textarea = document.getElementById('paste-overlay-textarea');
+        const closeBtn = document.getElementById('paste-overlay-close');
+        if (!overlay || !textarea) return;
+
+        closeBtn?.addEventListener('click', () => this.closePasteOverlay());
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && overlay.classList.contains('open')) this.closePasteOverlay();
+        });
+
+        // Handle text paste in the overlay textarea
+        // (image paste is already handled by the capture-phase handler in setupImagePaste,
+        //  which calls stopPropagation, so this handler only fires for text)
+        textarea.addEventListener('paste', () => {
+            setTimeout(() => {
+                const text = textarea.value;
+                if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify({ type: 'input', data: text }));
+                    this.showToast('Pasted');
+                }
+                this.closePasteOverlay();
+            }, 0);
+        });
+    }
+
     setupImagePaste() {
         // Use capture phase to intercept paste before xterm.js handles it
         document.addEventListener('paste', (e) => {
@@ -613,6 +665,7 @@ class WebClaudeCode {
     async uploadAndPasteImage(blob) {
         if (this.isUploadingImage) return;
         this.isUploadingImage = true;
+        this.closePasteOverlay();
         this.showToast('Uploading image...', 30000);
 
         try {

@@ -163,6 +163,25 @@
         }
         .toast.visible { opacity: 1; }
 
+        /* Paste Overlay (Safari fallback) */
+        .paste-overlay {
+            display: none; position: fixed; inset: 0; z-index: 1000;
+            background-color: #1e1e1e; flex-direction: column;
+        }
+        .paste-overlay.open { display: flex; }
+        .paste-overlay-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 10px 16px; background-color: #2d2d30;
+            border-bottom: 1px solid #3e3e42; color: #cccccc; font-size: 14px; flex-shrink: 0;
+        }
+        .paste-overlay-textarea {
+            flex: 1; background-color: #1e1e1e; color: #cccccc; border: none;
+            padding: 16px; font-family: 'Courier New', monospace; font-size: 16px;
+            resize: none; outline: none;
+            -webkit-user-select: text; user-select: text;
+        }
+        .paste-overlay-textarea::placeholder { color: #666; }
+
         .selection-overlay {
             display: none; position: fixed; inset: 0; z-index: 1000;
             background-color: #1e1e1e; flex-direction: column;
@@ -252,6 +271,14 @@
             </div>
         </div>
         <div class="selection-content" id="selection-content"></div>
+    </div>
+
+    <div class="paste-overlay" id="paste-overlay" role="dialog" aria-modal="true" aria-label="Paste content">
+        <div class="paste-overlay-header">
+            <span>Tap below, then paste</span>
+            <button class="selection-btn selection-close" id="paste-overlay-close">Cancel</button>
+        </div>
+        <textarea class="paste-overlay-textarea" id="paste-overlay-textarea" placeholder="Tap here and paste (Cmd+V or long press)" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
     </div>
 
     <div class="toast" id="toast"></div>
