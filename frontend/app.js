@@ -581,8 +581,8 @@ class WebClaudeCode {
         if (!overlay || !textarea) return;
         textarea.value = '';
         overlay.classList.add('open');
-        textarea.focus();
-        // Auto-dismiss after 30 seconds
+        // Don't auto-focus — let the user tap the textarea.
+        // Auto-focusing triggers Safari's native paste popup which is confusing.
         this._pasteOverlayTimer = setTimeout(() => this.closePasteOverlay(), 30000);
     }
 
@@ -608,19 +608,26 @@ class WebClaudeCode {
             if (e.key === 'Escape' && overlay.classList.contains('open')) this.closePasteOverlay();
         });
 
-        // Handle text paste in the overlay textarea
-        // (image paste is already handled by the capture-phase handler in setupImagePaste,
-        //  which calls stopPropagation, so this handler only fires for text)
-        textarea.addEventListener('paste', () => {
-            setTimeout(() => {
-                const text = textarea.value;
-                if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
-                    this.socket.send(JSON.stringify({ type: 'input', data: text }));
-                    this.showToast('Pasted');
-                }
-                this.closePasteOverlay();
-            }, 0);
-        });
+        // Send textarea content to terminal and close overlay
+        const submitPaste = () => {
+            const text = textarea.value;
+            if (!text) return;
+            textarea.value = '';
+            if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                this.socket.send(JSON.stringify({ type: 'input', data: text }));
+                this.showToast('Pasted');
+            }
+            this.closePasteOverlay();
+        };
+
+        // paste event: standard browsers
+        // (image paste is handled by the capture-phase handler in setupImagePaste,
+        //  which calls stopPropagation, so this only fires for text)
+        textarea.addEventListener('paste', () => setTimeout(submitPaste, 0));
+
+        // input event: fallback for Safari's native paste button,
+        // which may insert text without firing a paste event
+        textarea.addEventListener('input', () => setTimeout(submitPaste, 0));
     }
 
     setupImagePaste() {
