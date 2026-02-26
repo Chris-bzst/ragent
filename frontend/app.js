@@ -321,18 +321,7 @@ class WebClaudeCode {
                 this.openSelectionOverlay();
                 return;
             } else if (button.dataset.action === 'paste') {
-                if (navigator.clipboard && window.isSecureContext) {
-                    navigator.clipboard.readText().then((text) => {
-                        if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
-                            this.socket.send(JSON.stringify({ type: 'input', data: text }));
-                            this.showToast('Pasted');
-                        } else {
-                            this.openPasteOverlay();
-                        }
-                    }).catch(() => { this.openPasteOverlay(); });
-                } else {
-                    this.openPasteOverlay();
-                }
+                this.openPasteOverlay();
                 return;
             } else if (button.dataset.key) {
                 switch (button.dataset.key) {
