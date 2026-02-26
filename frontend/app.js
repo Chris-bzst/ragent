@@ -11,6 +11,7 @@ class WebClaudeCode {
         this.isUploadingImage = false;
         this.toastTimer = null;
         this._pasteOverlayTimer = null;
+        this._reconnectTimer = null;
 
         this.init();
     }
@@ -107,7 +108,23 @@ class WebClaudeCode {
         });
     }
 
+    reconnectNow() {
+        if (this._reconnectTimer) {
+            clearTimeout(this._reconnectTimer);
+            this._reconnectTimer = null;
+        }
+        this.reconnectAttempts = 0;
+        this.connect();
+    }
+
     connect() {
+        // Clean up old socket to prevent duplicate onclose triggers
+        if (this.socket) {
+            this.socket.onclose = null;
+            this.socket.onerror = null;
+            try { this.socket.close(); } catch (_) {}
+        }
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}`;
 
@@ -115,6 +132,9 @@ class WebClaudeCode {
 
         this.socket.onopen = () => {
             this.updateStatus('Connected', '#4ec9b0');
+            if (this.reconnectAttempts > 0) {
+                this.terminal.reset();
+            }
             this.reconnectAttempts = 0;
 
             this.stopHeartbeat();
@@ -179,7 +199,10 @@ class WebClaudeCode {
             }
             this.terminal.writeln(`\x1b[33mReconnecting in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts})...\x1b[0m`);
 
-            setTimeout(() => { this.connect(); }, delay);
+            this._reconnectTimer = setTimeout(() => {
+                this._reconnectTimer = null;
+                this.connect();
+            }, delay);
         } else {
             this.updateStatus('Connection failed', '#f44747');
             this.terminal.writeln('\r\n\x1b[31mConnection failed. Please refresh the page.\x1b[0m');
@@ -289,9 +312,13 @@ class WebClaudeCode {
         document.addEventListener('keydown', (e) => {
             if (e.ctrlKey && e.key === 'r' && this.socket && this.socket.readyState !== WebSocket.OPEN) {
                 e.preventDefault();
-                this.reconnectAttempts = 0;
-                this.connect();
-                this.terminal.writeln('\r\n\x1b[36mManual reconnection attempt...\x1b[0m');
+                this.reconnectNow();
+            }
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && (!this.socket || this.socket.readyState !== WebSocket.OPEN)) {
+                this.reconnectNow();
             }
         });
     }
@@ -309,7 +336,7 @@ class WebClaudeCode {
 
         virtualKeysContainer.addEventListener('click', (e) => {
             const button = e.target.closest('.vkey');
-            if (!button || button.closest('.vkey-menu-wrapper')) return;
+            if (!button || (button.parentElement?.classList.contains('vkey-menu-wrapper'))) return;
 
             e.preventDefault();
             let keyData = '';
