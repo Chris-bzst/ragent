@@ -309,7 +309,7 @@ class WebClaudeCode {
 
         virtualKeysContainer.addEventListener('click', (e) => {
             const button = e.target.closest('.vkey');
-            if (!button || button.id === 'window-menu-btn' || button.id === 'arrow-menu-btn') return;
+            if (!button || button.closest('.vkey-menu-wrapper')) return;
 
             e.preventDefault();
             let keyData = '';
@@ -328,6 +328,7 @@ class WebClaudeCode {
                     case 'Escape': keyData = '\x1b'; break;
                     case 'Tab': keyData = '\t'; break;
                     case 'ShiftTab': keyData = '\x1b[Z'; break;
+                    case 'Enter': keyData = '\r'; break;
                     case 'ArrowUp': keyData = '\x1b[A'; break;
                     case 'ArrowDown': keyData = '\x1b[B'; break;
                     case 'ArrowRight': keyData = '\x1b[C'; break;
@@ -342,6 +343,8 @@ class WebClaudeCode {
 
         this.setupWindowMenu();
         this.setupArrowMenu();
+        this.setupSimpleMenu('tab-menu-btn', 'tab-menu');
+        this.setupSimpleMenu('edit-menu-btn', 'edit-menu');
     }
 
     setupWindowMenu() {
@@ -355,8 +358,7 @@ class WebClaudeCode {
             if (isOpen) {
                 menu.classList.remove('open');
             } else {
-                const arrowPanel = document.getElementById('arrow-panel');
-                if (arrowPanel) arrowPanel.classList.remove('open');
+                this.closeAllMenus();
                 await this.fetchWindows();
                 await this.fetchPanes();
                 menu.classList.add('open');
@@ -371,9 +373,7 @@ class WebClaudeCode {
 
         document.addEventListener('click', (e) => {
             if (!e.target.closest('.vkey-menu-wrapper')) {
-                menu.classList.remove('open');
-                const arrowPanel = document.getElementById('arrow-panel');
-                if (arrowPanel) arrowPanel.classList.remove('open');
+                this.closeAllMenus();
             }
         });
 
@@ -498,8 +498,7 @@ class WebClaudeCode {
             const isOpen = panel.classList.contains('open');
             if (isOpen) { panel.classList.remove('open'); }
             else {
-                const windowMenu = document.getElementById('window-menu');
-                if (windowMenu) windowMenu.classList.remove('open');
+                this.closeAllMenus();
                 panel.classList.add('open');
                 const btnRect = menuBtn.getBoundingClientRect();
                 const panelRect = panel.getBoundingClientRect();
@@ -508,6 +507,58 @@ class WebClaudeCode {
                 panel.style.left = clampedLeft + 'px';
                 panel.style.bottom = (window.innerHeight - btnRect.top + 8) + 'px';
             }
+        });
+    }
+
+    setupSimpleMenu(btnId, menuId) {
+        const menuBtn = document.getElementById(btnId);
+        const menu = document.getElementById(menuId);
+        if (!menuBtn || !menu) return;
+
+        menuBtn.addEventListener('click', (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const isOpen = menu.classList.contains('open');
+            this.closeAllMenus();
+            if (!isOpen) {
+                menu.classList.add('open');
+                const btnRect = menuBtn.getBoundingClientRect();
+                const menuRect = menu.getBoundingClientRect();
+                const menuLeft = btnRect.left + (btnRect.width / 2) - (menuRect.width / 2);
+                const clampedLeft = Math.max(8, Math.min(menuLeft, window.innerWidth - menuRect.width - 8));
+                menu.style.left = clampedLeft + 'px';
+                menu.style.bottom = (window.innerHeight - btnRect.top + 8) + 'px';
+            }
+        });
+
+        menu.addEventListener('click', (e) => {
+            const item = e.target.closest('.vkey-menu-item');
+            if (!item) return;
+            e.preventDefault(); e.stopPropagation();
+
+            if (item.dataset.key) {
+                let keyData = '';
+                switch (item.dataset.key) {
+                    case 'Tab': keyData = '\t'; break;
+                    case 'ShiftTab': keyData = '\x1b[Z'; break;
+                }
+                if (keyData && this.socket && this.socket.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify({ type: 'input', data: keyData }));
+                }
+            } else if (item.dataset.action === 'select') {
+                this.openSelectionOverlay();
+            } else if (item.dataset.action === 'paste') {
+                this.openPasteOverlay();
+            }
+
+            menu.classList.remove('open');
+            this.terminal.focus();
+        });
+    }
+
+    closeAllMenus() {
+        ['window-menu', 'arrow-panel', 'tab-menu', 'edit-menu'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.classList.remove('open');
         });
     }
 

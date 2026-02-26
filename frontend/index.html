@@ -223,11 +223,22 @@
 
         <div class="virtual-keys" id="virtual-keys">
             <button class="vkey" data-key="Escape">ESC</button>
-            <button class="vkey" data-key="Tab">TAB</button>
-            <button class="vkey" data-key="ShiftTab">S+Tab</button>
+            <div class="vkey-menu-wrapper">
+                <button class="vkey" id="tab-menu-btn">Tab</button>
+                <div class="vkey-menu" id="tab-menu">
+                    <div class="vkey-menu-item" data-key="Tab">Tab</div>
+                    <div class="vkey-menu-item" data-key="ShiftTab">Shift + Tab</div>
+                </div>
+            </div>
             <button class="vkey" data-ctrl="c">^C</button>
-            <button class="vkey" data-action="select" title="Select text">Select</button>
-            <button class="vkey" data-action="paste" title="Paste clipboard">Paste</button>
+            <button class="vkey" data-key="Enter">Enter</button>
+            <div class="vkey-menu-wrapper">
+                <button class="vkey" id="edit-menu-btn">Edit</button>
+                <div class="vkey-menu" id="edit-menu">
+                    <div class="vkey-menu-item" data-action="select">Select</div>
+                    <div class="vkey-menu-item" data-action="paste">Paste</div>
+                </div>
+            </div>
         <div class="vkey-menu-wrapper">
             <button class="vkey" id="window-menu-btn">Win</button>
             <div class="vkey-menu" id="window-menu">
