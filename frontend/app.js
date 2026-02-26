@@ -8,6 +8,8 @@ class WebClaudeCode {
         this.maxReconnectAttempts = 999;
         this.activeWindowIndex = 0;
         this.pingInterval = null;
+        this.isUploadingImage = false;
+        this.toastTimer = null;
 
         this.init();
     }
@@ -319,15 +321,19 @@ class WebClaudeCode {
             } else if (button.dataset.action === 'paste') {
                 if (navigator.clipboard && window.isSecureContext) {
                     navigator.clipboard.read().then(async (clipboardItems) => {
-                        for (const item of clipboardItems) {
-                            const imageType = item.types.find(t => t.startsWith('image/'));
-                            if (imageType) {
-                                const blob = await item.getType(imageType);
-                                this.uploadAndPasteImage(blob);
-                                return;
+                        // Check if clipboard has text — if so, prefer text paste
+                        const hasText = clipboardItems.some(item => item.types.includes('text/plain'));
+                        if (!hasText && !this.isUploadingImage) {
+                            for (const item of clipboardItems) {
+                                const imageType = item.types.find(t => t.startsWith('image/'));
+                                if (imageType) {
+                                    const blob = await item.getType(imageType);
+                                    this.uploadAndPasteImage(blob);
+                                    return;
+                                }
                             }
                         }
-                        // No image found, fall back to text paste
+                        // Text paste
                         const text = await navigator.clipboard.readText();
                         if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
                             this.socket.send(JSON.stringify({ type: 'input', data: text }));
@@ -601,8 +607,14 @@ class WebClaudeCode {
     setupImagePaste() {
         // Intercept paste events to detect images
         document.addEventListener('paste', (e) => {
+            if (this.isUploadingImage) return;
+
             const items = e.clipboardData?.items;
             if (!items) return;
+
+            // If clipboard has text, user likely copied from a webpage — let text paste through
+            const hasText = Array.from(items).some(item => item.type === 'text/plain');
+            if (hasText) return;
 
             let imageItem = null;
             for (const item of items) {
@@ -612,7 +624,7 @@ class WebClaudeCode {
                 }
             }
 
-            if (!imageItem) return; // No image, let normal text paste happen
+            if (!imageItem) return;
 
             e.preventDefault();
             e.stopPropagation();
@@ -625,7 +637,9 @@ class WebClaudeCode {
     }
 
     async uploadAndPasteImage(blob) {
-        this.showToast('Uploading image...', 10000);
+        if (this.isUploadingImage) return;
+        this.isUploadingImage = true;
+        this.showToast('Uploading image...', 30000);
 
         try {
             const base64 = await new Promise((resolve, reject) => {
@@ -656,15 +670,18 @@ class WebClaudeCode {
             this.showToast('Image pasted');
         } catch (error) {
             this.showToast(error.message || 'Image paste failed');
+        } finally {
+            this.isUploadingImage = false;
         }
     }
 
     showToast(message, duration = 2000) {
         const toast = document.getElementById('toast');
         if (!toast) return;
+        if (this.toastTimer) clearTimeout(this.toastTimer);
         toast.textContent = message;
         toast.classList.add('visible');
-        setTimeout(() => { toast.classList.remove('visible'); }, duration);
+        this.toastTimer = setTimeout(() => { toast.classList.remove('visible'); this.toastTimer = null; }, duration);
     }
 
     fallbackCopy(text) {

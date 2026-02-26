@@ -42,8 +42,8 @@ if (AUTH_USERNAME && AUTH_PASSWORD) {
   console.log('HTTP Basic Authentication disabled (no AUTH_USERNAME/AUTH_PASSWORD set)');
 }
 
-// JSON body parser (10MB limit for base64 image uploads)
-app.use(express.json({ limit: '10mb' }));
+// JSON body parser (8MB limit for base64 image uploads)
+app.use(express.json({ limit: '8mb' }));
 
 // Security headers
 app.use((req, res, next) => {
@@ -80,7 +80,7 @@ app.use(express.static(staticRoot));
 
 const PASTE_IMAGE_DIR = '/tmp';
 const PASTE_IMAGE_PREFIX = 'ragent-paste-';
-const PASTE_IMAGE_MAX_BYTES = 10 * 1024 * 1024; // 10MB raw
+const PASTE_IMAGE_MAX_BYTES = 5 * 1024 * 1024; // 5MB raw (matches Claude Code's internal limit)
 
 // Valid image magic bytes
 const IMAGE_SIGNATURES = [
@@ -132,7 +132,7 @@ app.post('/api/paste-image', (req, res) => {
   }
 
   if (buffer.length > PASTE_IMAGE_MAX_BYTES) {
-    return res.status(413).json({ error: 'Image too large (max 10MB)' });
+    return res.status(413).json({ error: 'Image too large (max 5MB)' });
   }
 
   const ext = detectImageType(buffer);
