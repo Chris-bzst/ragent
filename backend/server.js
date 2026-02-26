@@ -475,6 +475,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   : null;
 
 const connections = new Map();
+let activeClientId = null;
 
 wss.on('connection', (ws, req) => {
   const origin = (req && req.headers && req.headers.origin) || '';
@@ -579,11 +580,13 @@ wss.on('connection', (ws, req) => {
 
       switch (type) {
         case 'input':
+          activeClientId = clientId;
           if (typeof data === 'string' && data.length <= 1000) {
             ptyProcess.write(data);
           }
           break;
         case 'resize':
+          if (activeClientId && activeClientId !== clientId) break;
           if (data && typeof data.cols === 'number' && typeof data.rows === 'number' &&
               data.cols > 0 && data.cols <= 1000 && data.rows > 0 && data.rows <= 1000) {
             ptyProcess.resize(data.cols, data.rows);
@@ -605,6 +608,7 @@ wss.on('connection', (ws, req) => {
   ws.on('error', () => cleanup(clientId));
 
   function cleanup(id) {
+    if (activeClientId === id) activeClientId = null;
     const connection = connections.get(id);
     if (connection) {
       if (TMUX_SESSION) {
