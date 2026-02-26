@@ -320,34 +320,12 @@ class WebClaudeCode {
                 return;
             } else if (button.dataset.action === 'paste') {
                 if (navigator.clipboard && window.isSecureContext) {
-                    navigator.clipboard.read().then(async (clipboardItems) => {
-                        // Check if clipboard has text — if so, prefer text paste
-                        const hasText = clipboardItems.some(item => item.types.includes('text/plain'));
-                        if (!hasText && !this.isUploadingImage) {
-                            for (const item of clipboardItems) {
-                                const imageType = item.types.find(t => t.startsWith('image/'));
-                                if (imageType) {
-                                    const blob = await item.getType(imageType);
-                                    this.uploadAndPasteImage(blob);
-                                    return;
-                                }
-                            }
-                        }
-                        // Text paste
-                        const text = await navigator.clipboard.readText();
+                    navigator.clipboard.readText().then((text) => {
                         if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
                             this.socket.send(JSON.stringify({ type: 'input', data: text }));
                             this.showToast('Pasted');
                         }
-                    }).catch(() => {
-                        // clipboard.read() may not be available, fall back to readText
-                        navigator.clipboard.readText().then((text) => {
-                            if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
-                                this.socket.send(JSON.stringify({ type: 'input', data: text }));
-                                this.showToast('Pasted');
-                            }
-                        }).catch(() => { this.showToast('Paste failed, check clipboard permissions'); });
-                    });
+                    }).catch(() => { this.showToast('Paste failed, check clipboard permissions'); });
                 } else {
                     this.showToast('Paste not supported in this environment');
                 }
@@ -605,16 +583,12 @@ class WebClaudeCode {
     }
 
     setupImagePaste() {
-        // Intercept paste events to detect images
+        // Use capture phase to intercept paste before xterm.js handles it
         document.addEventListener('paste', (e) => {
             if (this.isUploadingImage) return;
 
             const items = e.clipboardData?.items;
             if (!items) return;
-
-            // If clipboard has text, user likely copied from a webpage — let text paste through
-            const hasText = Array.from(items).some(item => item.type === 'text/plain');
-            if (hasText) return;
 
             let imageItem = null;
             for (const item of items) {
@@ -633,7 +607,7 @@ class WebClaudeCode {
             if (!blob) return;
 
             this.uploadAndPasteImage(blob);
-        });
+        }, true); // capture phase — fires before xterm.js's bubble handler
     }
 
     async uploadAndPasteImage(blob) {
