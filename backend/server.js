@@ -4,6 +4,7 @@ const WebSocket = require('ws');
 const pty = require('node-pty');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { execSync, exec } = require('child_process');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const { detectOpenPorts, isValidPort, isBlockedPort } = require('./utils/port-detection');
@@ -41,8 +42,8 @@ if (AUTH_USERNAME && AUTH_PASSWORD) {
   console.log('HTTP Basic Authentication disabled (no AUTH_USERNAME/AUTH_PASSWORD set)');
 }
 
-// JSON body parser
-app.use(express.json());
+// JSON body parser (10MB limit for base64 image uploads)
+app.use(express.json({ limit: '10mb' }));
 
 // Security headers
 app.use((req, res, next) => {
@@ -74,6 +75,81 @@ const staticRoot = staticCandidates.find((candidate) => {
 }) || path.join(__dirname, '../frontend');
 
 app.use(express.static(staticRoot));
+
+// ==================== Image Paste API ====================
+
+const PASTE_IMAGE_DIR = '/tmp';
+const PASTE_IMAGE_PREFIX = 'ragent-paste-';
+const PASTE_IMAGE_MAX_BYTES = 10 * 1024 * 1024; // 10MB raw
+
+// Valid image magic bytes
+const IMAGE_SIGNATURES = [
+  { bytes: [0x89, 0x50, 0x4E, 0x47], ext: 'png' },  // PNG
+  { bytes: [0xFF, 0xD8, 0xFF], ext: 'jpg' },          // JPEG
+  { bytes: [0x47, 0x49, 0x46], ext: 'gif' },           // GIF
+  { bytes: [0x42, 0x4D], ext: 'bmp' },                 // BMP
+];
+
+function detectImageType(buffer) {
+  for (const sig of IMAGE_SIGNATURES) {
+    if (sig.bytes.every((b, i) => buffer[i] === b)) return sig.ext;
+  }
+  // WebP: RIFF....WEBP
+  if (buffer.length >= 12 &&
+      buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+      buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) {
+    return 'webp';
+  }
+  return null;
+}
+
+// Cleanup old paste images on startup
+try {
+  const files = fs.readdirSync(PASTE_IMAGE_DIR);
+  for (const file of files) {
+    if (file.startsWith(PASTE_IMAGE_PREFIX)) {
+      fs.unlinkSync(path.join(PASTE_IMAGE_DIR, file));
+    }
+  }
+} catch (_) {}
+
+app.post('/api/paste-image', (req, res) => {
+  const { data } = req.body || {};
+
+  if (!data || typeof data !== 'string') {
+    return res.status(400).json({ error: 'Missing base64 image data' });
+  }
+
+  let buffer;
+  try {
+    buffer = Buffer.from(data, 'base64');
+  } catch {
+    return res.status(400).json({ error: 'Invalid base64 data' });
+  }
+
+  if (buffer.length === 0) {
+    return res.status(400).json({ error: 'Empty image data' });
+  }
+
+  if (buffer.length > PASTE_IMAGE_MAX_BYTES) {
+    return res.status(413).json({ error: 'Image too large (max 10MB)' });
+  }
+
+  const ext = detectImageType(buffer);
+  if (!ext) {
+    return res.status(400).json({ error: 'Unsupported image format' });
+  }
+
+  const filename = `${PASTE_IMAGE_PREFIX}${crypto.randomUUID()}.${ext}`;
+  const filepath = path.join(PASTE_IMAGE_DIR, filename);
+
+  try {
+    fs.writeFileSync(filepath, buffer);
+    res.json({ path: filepath });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save image' });
+  }
+});
 
 // ==================== Tmux Window Management API ====================
 

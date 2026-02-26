@@ -27,6 +27,7 @@ class WebClaudeCode {
         this.setupEventListeners();
         this.setupVirtualKeys();
         this.setupSelectionOverlay();
+        this.setupImagePaste();
     }
 
     setupTerminal() {
@@ -317,12 +318,30 @@ class WebClaudeCode {
                 return;
             } else if (button.dataset.action === 'paste') {
                 if (navigator.clipboard && window.isSecureContext) {
-                    navigator.clipboard.readText().then((text) => {
+                    navigator.clipboard.read().then(async (clipboardItems) => {
+                        for (const item of clipboardItems) {
+                            const imageType = item.types.find(t => t.startsWith('image/'));
+                            if (imageType) {
+                                const blob = await item.getType(imageType);
+                                this.uploadAndPasteImage(blob);
+                                return;
+                            }
+                        }
+                        // No image found, fall back to text paste
+                        const text = await navigator.clipboard.readText();
                         if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
                             this.socket.send(JSON.stringify({ type: 'input', data: text }));
                             this.showToast('Pasted');
                         }
-                    }).catch(() => { this.showToast('Paste failed, check clipboard permissions'); });
+                    }).catch(() => {
+                        // clipboard.read() may not be available, fall back to readText
+                        navigator.clipboard.readText().then((text) => {
+                            if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
+                                this.socket.send(JSON.stringify({ type: 'input', data: text }));
+                                this.showToast('Pasted');
+                            }
+                        }).catch(() => { this.showToast('Paste failed, check clipboard permissions'); });
+                    });
                 } else {
                     this.showToast('Paste not supported in this environment');
                 }
@@ -577,6 +596,67 @@ class WebClaudeCode {
                 }).catch(() => { this.fallbackCopy(text); this.closeSelectionOverlay(); });
             } else { this.fallbackCopy(text); this.closeSelectionOverlay(); }
         });
+    }
+
+    setupImagePaste() {
+        // Intercept paste events to detect images
+        document.addEventListener('paste', (e) => {
+            const items = e.clipboardData?.items;
+            if (!items) return;
+
+            let imageItem = null;
+            for (const item of items) {
+                if (item.type.startsWith('image/')) {
+                    imageItem = item;
+                    break;
+                }
+            }
+
+            if (!imageItem) return; // No image, let normal text paste happen
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            const blob = imageItem.getAsFile();
+            if (!blob) return;
+
+            this.uploadAndPasteImage(blob);
+        });
+    }
+
+    async uploadAndPasteImage(blob) {
+        this.showToast('Uploading image...', 10000);
+
+        try {
+            const base64 = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+
+            const resp = await fetch('/api/paste-image', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ data: base64 }),
+            });
+
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.error || 'Upload failed');
+            }
+
+            const { path } = await resp.json();
+
+            // Paste the file path into the terminal via bracketed paste
+            if (this.terminal) {
+                this.terminal.paste(path);
+            }
+
+            this.showToast('Image pasted');
+        } catch (error) {
+            this.showToast(error.message || 'Image paste failed');
+        }
     }
 
     showToast(message, duration = 2000) {
