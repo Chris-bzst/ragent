@@ -11,6 +11,7 @@ class WebClaudeCode {
         this.isUploadingImage = false;
         this.toastTimer = null;
         this._pasteOverlayTimer = null;
+        this._pasteSent = false;
         this._reconnectTimer = null;
 
         this.init();
@@ -98,6 +99,10 @@ class WebClaudeCode {
         this.terminal.onData((data) => {
             if (this.socket && this.socket.readyState === WebSocket.OPEN) {
                 this.socket.send(JSON.stringify({ type: 'input', data }));
+            } else if (data.length > 1) {
+                // Multi-char input is likely a paste; notify user it was lost.
+                // Single chars (keystrokes) are not worth alerting on.
+                this.showToast('Not connected');
             }
         });
 
@@ -658,6 +663,7 @@ class WebClaudeCode {
         const textarea = document.getElementById('paste-overlay-textarea');
         if (!overlay || !textarea) return;
         textarea.value = '';
+        this._pasteSent = false;
         overlay.classList.add('open');
         // Focus immediately — must be synchronous within the user gesture (click)
         // so that mobile Safari allows the focus. Safari's native paste popup
@@ -688,31 +694,42 @@ class WebClaudeCode {
             if (e.key === 'Escape' && overlay.classList.contains('open')) this.closePasteOverlay();
         });
 
-        // Send textarea content to terminal and close overlay (debounced)
-        let submitTimer = null;
-        const submitPaste = () => {
-            if (submitTimer) clearTimeout(submitTimer);
-            submitTimer = setTimeout(() => {
-                submitTimer = null;
-                const text = textarea.value;
-                if (!text) return;
-                textarea.value = '';
-                if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-                    this.socket.send(JSON.stringify({ type: 'input', data: text }));
-                    this.showToast('Pasted');
-                }
-                this.closePasteOverlay();
-            }, 50);
+        // Send text to terminal and close overlay
+        const sendPaste = (text) => {
+            if (!text || this._pasteSent) return;
+            this._pasteSent = true;
+            textarea.value = '';
+            if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                this.socket.send(JSON.stringify({ type: 'input', data: text }));
+                this.showToast('Pasted');
+            } else {
+                this.showToast('Not connected');
+            }
+            this.closePasteOverlay();
         };
 
-        // paste event: standard browsers
-        // (image paste is handled by the capture-phase handler in setupImagePaste,
-        //  which calls stopPropagation, so this only fires for text)
-        textarea.addEventListener('paste', submitPaste);
+        // paste event: read directly from clipboardData (textarea.value is
+        // not yet updated when the paste event fires, so reading it via a
+        // timer was unreliable and caused intermittent silent failures).
+        textarea.addEventListener('paste', (e) => {
+            const text = e.clipboardData?.getData('text/plain');
+            if (text) {
+                e.preventDefault();
+                sendPaste(text);
+            }
+            // If clipboardData is empty (rare), fall through to input event
+        });
 
         // input event: fallback for Safari's native paste button,
         // which may insert text without firing a paste event
-        textarea.addEventListener('input', submitPaste);
+        let inputTimer = null;
+        textarea.addEventListener('input', () => {
+            if (inputTimer) clearTimeout(inputTimer);
+            inputTimer = setTimeout(() => {
+                inputTimer = null;
+                sendPaste(textarea.value);
+            }, 50);
+        });
     }
 
     setupImagePaste() {
@@ -723,15 +740,22 @@ class WebClaudeCode {
             const items = e.clipboardData?.items;
             if (!items) return;
 
+            // Check if clipboard contains text — if so, let the normal text
+            // paste flow handle it.  Copying from web pages often includes
+            // both text and an auto-generated image representation; we must
+            // not hijack those pastes.
+            let hasText = false;
             let imageItem = null;
             for (const item of items) {
+                if (item.kind === 'string' && (item.type === 'text/plain' || item.type === 'text/html')) {
+                    hasText = true;
+                }
                 if (item.type.startsWith('image/')) {
                     imageItem = item;
-                    break;
                 }
             }
 
-            if (!imageItem) return;
+            if (!imageItem || hasText) return;
 
             e.preventDefault();
             e.stopPropagation();
