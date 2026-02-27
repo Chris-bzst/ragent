@@ -227,12 +227,16 @@ class WebClaudeCode {
         const rowPx = fontSize * lineHeight;
 
         let touchStartY = 0;
+        let touchClientX = 0;
+        let touchClientY = 0;
         let accumulated = 0;
         let isTouchScrolling = false;
 
         terminalEl.addEventListener('touchstart', (e) => {
             if (e.touches.length === 1) {
                 touchStartY = e.touches[0].clientY;
+                touchClientX = e.touches[0].clientX;
+                touchClientY = e.touches[0].clientY;
                 accumulated = 0;
                 isTouchScrolling = false;
             }
@@ -256,6 +260,8 @@ class WebClaudeCode {
                     for (let i = 0; i < Math.abs(lines); i++) {
                         wheelTarget.dispatchEvent(new WheelEvent('wheel', {
                             deltaY: lines > 0 ? rowPx : -rowPx,
+                            clientX: touchClientX,
+                            clientY: touchClientY,
                             bubbles: true, cancelable: true
                         }));
                     }
