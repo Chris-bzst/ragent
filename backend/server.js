@@ -178,13 +178,13 @@ app.get('/api/tmux/windows', (req, res) => {
   }
 });
 
-function getSessionStartPath() {
+function getActivePaneCwdPath() {
   try {
-    const sessionPath = execSync(
-      `tmux display-message -t '${shellEscape(TMUX_SESSION)}' -p '#{session_path}'`,
+    const panePath = execSync(
+      `tmux display-message -t '${shellEscape(TMUX_SESSION)}' -p '#{pane_current_path}'`,
       { env: tmuxEnv, encoding: 'utf-8' }
     ).trim();
-    return sessionPath || WORKSPACE_DIR;
+    return panePath || WORKSPACE_DIR;
   } catch (error) {
     return WORKSPACE_DIR;
   }
@@ -196,7 +196,7 @@ app.post('/api/tmux/window', (req, res) => {
   }
 
   try {
-    const startPath = getSessionStartPath();
+    const startPath = getActivePaneCwdPath();
     execSync(`tmux new-window -t '${shellEscape(TMUX_SESSION)}' -c '${shellEscape(startPath)}'`, { env: tmuxEnv });
     execSync(`tmux send-keys -t '${shellEscape(TMUX_SESSION)}' 'source /etc/profile.d/claude-env.sh 2>/dev/null; export PATH=/workspace/.local/bin:$' 'PATH' Enter`, { env: tmuxEnv });
     res.json({ success: true });
@@ -292,7 +292,7 @@ app.post('/api/tmux/split', (req, res) => {
 
     const { direction } = req.body || {};
     const flag = direction === 'horizontal' ? '-h' : '-v';
-    const startPath = getSessionStartPath();
+    const startPath = getActivePaneCwdPath();
     execSync(`tmux split-window -t '${shellEscape(TMUX_SESSION)}' ${flag} -c '${shellEscape(startPath)}'`, { env: tmuxEnv });
     execSync(`tmux send-keys -t '${shellEscape(TMUX_SESSION)}' 'source /etc/profile.d/claude-env.sh 2>/dev/null; export PATH=/workspace/.local/bin:$' 'PATH' Enter`, { env: tmuxEnv });
     res.json({ success: true });
