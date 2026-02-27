@@ -93,6 +93,22 @@ class WebClaudeCode {
                     return false;
                 }
             }
+            // Handle Ctrl+V / Cmd+V: use clipboard API directly so paste
+            // keeps working even after xterm.js's internal textarea loses
+            // clipboard permission (which causes the "works then stops" bug).
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V') && e.type === 'keydown') {
+                if (navigator.clipboard && window.isSecureContext) {
+                    e.preventDefault(); // prevent browser's default paste to avoid double-send
+                    navigator.clipboard.readText().then((text) => {
+                        if (text && this.socket && this.socket.readyState === WebSocket.OPEN) {
+                            this.socket.send(JSON.stringify({ type: 'input', data: text }));
+                        }
+                    }).catch(() => {});
+                    return false;
+                }
+                // No clipboard API — let xterm.js handle paste natively
+                return true;
+            }
             return true;
         });
 
@@ -585,7 +601,9 @@ class WebClaudeCode {
             } else if (item.dataset.action === 'select') {
                 this.openSelectionOverlay();
             } else if (item.dataset.action === 'paste') {
+                menu.classList.remove('open');
                 this.openPasteOverlay();
+                return; // don't call terminal.focus() — overlay needs focus
             }
 
             menu.classList.remove('open');
