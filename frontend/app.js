@@ -248,6 +248,11 @@ class WebClaudeCode {
         let accumulated = 0;
         let isTouchScrolling = false;
 
+        // Use capture phase to intercept touch events BEFORE xterm.js's own
+        // handlers on .xterm-screen. When xterm.js thinks mouse protocol is
+        // inactive, it handles touch scroll itself via Viewport.handleTouchMove
+        // (which scrolls the scrollback buffer with no pane coordinates) and
+        // calls stopPropagation, so bubble-phase handlers on #terminal never fire.
         terminalEl.addEventListener('touchstart', (e) => {
             if (e.touches.length === 1) {
                 touchStartY = e.touches[0].clientY;
@@ -256,7 +261,7 @@ class WebClaudeCode {
                 accumulated = 0;
                 isTouchScrolling = false;
             }
-        }, { passive: true });
+        }, { capture: true, passive: true });
 
         terminalEl.addEventListener('touchmove', (e) => {
             if (e.touches.length !== 1) return;
@@ -268,6 +273,8 @@ class WebClaudeCode {
             }
 
             if (isTouchScrolling) {
+                e.preventDefault();
+                e.stopPropagation();
                 accumulated += deltaY;
                 touchStartY = currentY;
                 const lines = Math.trunc(accumulated / rowPx);
@@ -293,9 +300,8 @@ class WebClaudeCode {
                     }
                     accumulated -= lines * rowPx;
                 }
-                e.preventDefault();
             }
-        }, { passive: false });
+        }, { capture: true, passive: false });
     }
 
     updateStatus(text, color = '#cccccc') {
