@@ -272,14 +272,25 @@ class WebClaudeCode {
                 touchStartY = currentY;
                 const lines = Math.trunc(accumulated / rowPx);
                 if (lines !== 0) {
-                    const wheelTarget = terminalEl.querySelector('.xterm-screen') || terminalEl;
-                    for (let i = 0; i < Math.abs(lines); i++) {
-                        wheelTarget.dispatchEvent(new WheelEvent('wheel', {
-                            deltaY: lines > 0 ? rowPx : -rowPx,
-                            clientX: touchClientX,
-                            clientY: touchClientY,
-                            bubbles: true, cancelable: true
-                        }));
+                    const screenEl = terminalEl.querySelector('.xterm-screen');
+                    if (screenEl && this.socket && this.socket.readyState === WebSocket.OPEN) {
+                        const rect = screenEl.getBoundingClientRect();
+                        const cellWidth = rect.width / this.terminal.cols;
+                        const cellHeight = rect.height / this.terminal.rows;
+                        const col = Math.max(1, Math.min(this.terminal.cols,
+                            Math.floor((touchClientX - rect.left) / cellWidth) + 1));
+                        const row = Math.max(1, Math.min(this.terminal.rows,
+                            Math.floor((touchClientY - rect.top) / cellHeight) + 1));
+                        // SGR mouse protocol: button 64 = scroll up, 65 = scroll down
+                        // lines > 0 means finger swiped up (positive deltaY) → wheel down (button 65)
+                        // This matches the original WheelEvent behavior (positive deltaY = scroll down)
+                        const btn = lines > 0 ? 65 : 64;
+                        for (let i = 0; i < Math.abs(lines); i++) {
+                            this.socket.send(JSON.stringify({
+                                type: 'input',
+                                data: `\x1b[<${btn};${col};${row}M`
+                            }));
+                        }
                     }
                     accumulated -= lines * rowPx;
                 }
