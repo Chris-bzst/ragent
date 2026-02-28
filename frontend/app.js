@@ -285,12 +285,11 @@ class WebClaudeCode {
                         // lines > 0 means finger swiped up (positive deltaY) → wheel down (button 65)
                         // This matches the original WheelEvent behavior (positive deltaY = scroll down)
                         const btn = lines > 0 ? 65 : 64;
-                        for (let i = 0; i < Math.abs(lines); i++) {
-                            this.socket.send(JSON.stringify({
-                                type: 'input',
-                                data: `\x1b[<${btn};${col};${row}M`
-                            }));
-                        }
+                        const seq = `\x1b[<${btn};${col};${row}M`;
+                        this.socket.send(JSON.stringify({
+                            type: 'input',
+                            data: seq.repeat(Math.abs(lines))
+                        }));
                     }
                     accumulated -= lines * rowPx;
                 }
