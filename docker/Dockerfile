@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     python3 \
     build-essential \
     ca-certificates \
+    gosu \
     # Browser automation dependencies (optional, for Playwright MCP)
     # These are lightweight system libs only (~50MB), not Chromium itself
     libx11-xcb1 \
@@ -38,6 +39,9 @@ RUN mkdir -p /workspace && chmod 755 /workspace
 ENV HOME=/workspace
 ENV PATH="/workspace/.local/bin:$PATH"
 
+# Create session data directory
+RUN mkdir -p /workspace/data/sessions
+
 # Set working directory for backend application
 WORKDIR /app/backend
 
@@ -56,6 +60,11 @@ COPY frontend/ /app/frontend/
 # Copy and prepare entrypoint script
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Create non-root user so Claude Code allows bypassPermissions mode.
+# /workspace ownership is set at runtime in entrypoint.sh (volumes override build-time chown).
+RUN groupadd -r claude && useradd -r -g claude -M -d /workspace -s /bin/bash claude \
+    && chown -R claude:claude /app
 
 # Set default shell
 ENV SHELL=/bin/bash

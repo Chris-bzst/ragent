@@ -78,23 +78,33 @@ fi
 
 echo "Configuration completed"
 
+# ==================== Fix ownership ====================
+# Entrypoint runs as root to configure system files above;
+# now hand everything to the non-root 'claude' user.
+# Only chown paths that root touched above; skip deep recursion on /workspace
+# to avoid slow startup when a large volume is mounted.
+chown claude:claude /workspace
+for dir in /workspace/.local /workspace/.claude /workspace/data /app; do
+    [ -e "$dir" ] && chown -R claude:claude "$dir"
+done
+
 # ==================== tmux Persistent Session ====================
 export TMUX_SESSION_NAME
 
 if [ ! -z "$TMUX_SESSION_NAME" ]; then
     echo "Setting up tmux persistent session: $TMUX_SESSION_NAME"
 
-    # Kill any existing dead tmux server
-    tmux kill-server 2>/dev/null || true
+    # Kill any existing dead tmux server (must target claude user's server)
+    gosu claude tmux kill-server 2>/dev/null || true
 
-    # Create tmux session
-    if ! tmux has-session -t "$TMUX_SESSION_NAME" 2>/dev/null; then
-        tmux new-session -d -s "$TMUX_SESSION_NAME" -c /workspace
-        tmux set-option -t "$TMUX_SESSION_NAME" history-limit 50000
-        tmux set-option -t "$TMUX_SESSION_NAME" mouse on
-        tmux send-keys -t "$TMUX_SESSION_NAME" "source /etc/profile.d/claude-env.sh 2>/dev/null || export PATH=/workspace/.local/bin:\$PATH" Enter
-        tmux send-keys -t "$TMUX_SESSION_NAME" "clear" Enter
-        tmux send-keys -t "$TMUX_SESSION_NAME" "cd /workspace" Enter
+    # Create tmux session as non-root user
+    if ! gosu claude tmux has-session -t "$TMUX_SESSION_NAME" 2>/dev/null; then
+        gosu claude tmux new-session -d -s "$TMUX_SESSION_NAME" -c /workspace
+        gosu claude tmux set-option -t "$TMUX_SESSION_NAME" history-limit 50000
+        gosu claude tmux set-option -t "$TMUX_SESSION_NAME" mouse on
+        gosu claude tmux send-keys -t "$TMUX_SESSION_NAME" "source /etc/profile.d/claude-env.sh 2>/dev/null || export PATH=/workspace/.local/bin:\$PATH" Enter
+        gosu claude tmux send-keys -t "$TMUX_SESSION_NAME" "clear" Enter
+        gosu claude tmux send-keys -t "$TMUX_SESSION_NAME" "cd /workspace" Enter
         echo "tmux session '$TMUX_SESSION_NAME' created"
     fi
 
@@ -108,8 +118,8 @@ echo "Starting Web Claude Code server..."
 cd /app/backend
 
 if [ -f "server.js" ]; then
-    exec node server.js
+    exec gosu claude node server.js
 else
     echo "server.js not found at /app/backend"
-    tail -f /dev/null
+    exec gosu claude tail -f /dev/null
 fi
