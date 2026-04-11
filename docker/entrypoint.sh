@@ -62,31 +62,37 @@ else
     echo "Claude Code CLI is available"
 fi
 
-# If API key is provided, create Claude CLI settings
-if [ ! -z "$CLAUDE_API_KEY" ]; then
-    mkdir -p /workspace/.claude
-    cat > /workspace/.claude/settings.json << EOF
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "${CLAUDE_API_KEY}",
-    "ANTHROPIC_BASE_URL": "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
-  }
-}
-EOF
-    chmod 600 /workspace/.claude/settings.json
+  # Create Claude CLI settings (always enable bypass permissions)
+  mkdir -p /workspace/.claude                           
+  if [ ! -z "$CLAUDE_API_KEY" ]; then                        
+      cat > /workspace/.claude/settings.json << EOF     
+  {                                                          
+    "permissions": {                      
+      "allow": ["*"]
+    },                                                  
+    "env": {
+      "ANTHROPIC_AUTH_TOKEN": "${CLAUDE_API_KEY}",      
+      "ANTHROPIC_BASE_URL": "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
+    }                                         
+  }                                       
+  EOF
+  else                                                  
+      cat > /workspace/.claude/settings.json << 'EOF'
+  {                                                     
+    "permissions": {                                         
+      "allow": ["*"]
+    }
+  }                                           
+  EOF                                     
 fi
+chmod 600 /workspace/.claude/settings.json 
 
 echo "Configuration completed"
 
-# ==================== Fix ownership ====================
-# Entrypoint runs as root to configure system files above;
-# now hand everything to the non-root 'claude' user.
-# Only chown paths that root touched above; skip deep recursion on /workspace
-# to avoid slow startup when a large volume is mounted.
-chown claude:claude /workspace
-for dir in /workspace/.local /workspace/.claude /workspace/data /app; do
-    [ -e "$dir" ] && chown -R claude:claude "$dir"
-done
+  # ==================== Fix ownership ====================
+  # Entrypoint runs as root to configure system files above;
+  # now hand everything to the non-root 'claude' user.
+  chown -R claude:claude /workspace /app
 
 # ==================== tmux Persistent Session ====================
 export TMUX_SESSION_NAME
