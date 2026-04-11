@@ -62,37 +62,37 @@ else
     echo "Claude Code CLI is available"
 fi
 
-  # Create Claude CLI settings (always enable bypass permissions)
-  mkdir -p /workspace/.claude                           
-  if [ ! -z "$CLAUDE_API_KEY" ]; then                        
-      cat > /workspace/.claude/settings.json << EOF     
-  {                                                          
-    "permissions": {                      
-      "allow": ["*"]
-    },                                                  
-    "env": {
-      "ANTHROPIC_AUTH_TOKEN": "${CLAUDE_API_KEY}",      
-      "ANTHROPIC_BASE_URL": "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
-    }                                         
-  }                                       
-  EOF
-  else                                                  
-      cat > /workspace/.claude/settings.json << 'EOF'
-  {                                                     
-    "permissions": {                                         
-      "allow": ["*"]
-    }
-  }                                           
-  EOF                                     
+# Create Claude CLI settings (always enable bypass permissions)
+mkdir -p /workspace/.claude
+if [ ! -z "$CLAUDE_API_KEY" ]; then
+    cat > /workspace/.claude/settings.json << EOF
+{
+  "permissions": {
+    "allow": ["*"]
+  },
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "${CLAUDE_API_KEY}",
+    "ANTHROPIC_BASE_URL": "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
+  }
+}
+EOF
+else
+    cat > /workspace/.claude/settings.json << 'EOF'
+{
+  "permissions": {
+    "allow": ["*"]
+  }
+}
+EOF
 fi
-chmod 600 /workspace/.claude/settings.json 
+chmod 600 /workspace/.claude/settings.json
 
 echo "Configuration completed"
 
-  # ==================== Fix ownership ====================
-  # Entrypoint runs as root to configure system files above;
-  # now hand everything to the non-root 'claude' user.
-  chown -R claude:claude /workspace /app
+# ==================== Fix ownership ====================
+# Entrypoint runs as root to configure system files above;
+# now hand everything to the non-root 'claude' user.
+chown -R claude:claude /workspace /app
 
 # ==================== tmux Persistent Session ====================
 export TMUX_SESSION_NAME
