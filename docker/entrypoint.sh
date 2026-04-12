@@ -68,7 +68,7 @@ if [ ! -z "$CLAUDE_API_KEY" ]; then
     cat > /workspace/.claude/settings.json << EOF
 {
   "permissions": {
-    "allow": ["*"]
+    "defaultMode": "bypassPermissions"
   },
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "${CLAUDE_API_KEY}",
@@ -80,7 +80,7 @@ else
     cat > /workspace/.claude/settings.json << 'EOF'
 {
   "permissions": {
-    "allow": ["*"]
+    "defaultMode": "bypassPermissions"
   }
 }
 EOF
