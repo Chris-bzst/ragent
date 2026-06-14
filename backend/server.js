@@ -8,6 +8,25 @@ const crypto = require('crypto');
 const { execSync, exec } = require('child_process');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const { detectOpenPorts, isValidPort, isBlockedPort } = require('./utils/port-detection');
+const SessionStore = require('./utils/session-store');
+
+// Agent SDK — lazy-loaded since it's an optional ESM module
+let claudeQuery = null;
+async function getClaudeQuery() {
+  if (!claudeQuery) {
+    try {
+      const sdk = await import('@anthropic-ai/claude-code');
+      claudeQuery = sdk.query;
+    } catch (err) {
+      console.error('Failed to load @anthropic-ai/claude-code:', err.message);
+      throw new Error('Agent SDK not available');
+    }
+  }
+  return claudeQuery;
+}
+
+// Track active chat abort controllers per session
+const activeChatAborts = new Map();
 
 // Shell path escaping to prevent command injection
 function shellEscape(str) {
@@ -23,6 +42,79 @@ const WORKSPACE_DIR = process.env.WORKSPACE_DIR ||
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// ── Probe dispatch endpoint (the "wake glue") ──────────────────────────────
+// Probe POSTs a signed change-request here when its acceptance finds issues on
+// a PR. Ragent clones the PR branch, runs Claude Code headless to fix the
+// reported findings, and pushes — closing the loop in Ragent's environment.
+// Mounted before basic-auth: authenticated by HMAC signature, not credentials.
+const DISPATCH_SECRET = process.env.PROBE_DISPATCH_SECRET;
+const DISPATCH_GH_TOKEN = process.env.DISPATCH_GITHUB_TOKEN;
+const DISPATCH_AUTHOR_NAME = process.env.DISPATCH_GIT_AUTHOR_NAME || 'ragent';
+const DISPATCH_AUTHOR_EMAIL = process.env.DISPATCH_GIT_AUTHOR_EMAIL || '';
+
+app.post('/api/dispatch', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
+  if (!DISPATCH_SECRET || !DISPATCH_GH_TOKEN) {
+    return res.status(503).json({ error: 'dispatch not configured (set PROBE_DISPATCH_SECRET + DISPATCH_GITHUB_TOKEN)' });
+  }
+  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+  const sig = req.headers['x-probe-signature-256'];
+  const expected = 'sha256=' + crypto.createHmac('sha256', DISPATCH_SECRET).update(raw).digest('hex');
+  const ok = typeof sig === 'string' && sig.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  if (!ok) return res.status(401).json({ error: 'invalid signature' });
+
+  let p;
+  try { p = JSON.parse(raw.toString('utf8')); } catch { return res.status(400).json({ error: 'invalid JSON' }); }
+  if (!/^[\w.-]+\/[\w.-]+$/.test(p.repo || '') || !/^[\w./-]+$/.test(p.branch || '') || !Number.isInteger(p.pr_number)) {
+    return res.status(400).json({ error: 'malformed payload (repo/branch/pr_number)' });
+  }
+
+  res.status(202).json({ accepted: true });
+  runDispatch(p).catch((e) => console.error('[dispatch] failed:', e.message));
+});
+
+async function runDispatch(p) {
+  const dir = path.join(WORKSPACE_DIR, 'dispatch', `${p.repo.replace('/', '-')}-pr${p.pr_number}`);
+  const cloneUrl = `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${p.repo}.git`;
+  console.error(`[dispatch] ${p.repo}#${p.pr_number} → ${dir} (branch ${p.branch})`);
+
+  execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
+  execSync(`git clone --depth 1 -b '${shellEscape(p.branch)}' '${cloneUrl}' '${shellEscape(dir)}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(dir)}' config user.name '${shellEscape(DISPATCH_AUTHOR_NAME)}'`, { stdio: 'ignore' });
+  if (DISPATCH_AUTHOR_EMAIL) execSync(`git -C '${shellEscape(dir)}' config user.email '${shellEscape(DISPATCH_AUTHOR_EMAIL)}'`, { stdio: 'ignore' });
+
+  const findingsText = (p.findings || [])
+    .map((f, i) => `${i + 1}. [${f.severity}] ${f.title}\n   ${f.detail || ''}${f.repro_steps && f.repro_steps.length ? `\n   Repro: ${f.repro_steps.join(' → ')}` : ''}`)
+    .join('\n');
+  const prompt = `You are fixing a pull request. Probe (an acceptance agent) tested PR #${p.pr_number} on its preview deployment and found these issues:
+
+${findingsText}
+
+Summary: ${p.summary || ''}
+
+Fix ONLY these reported issues in this repository. Do not make unrelated changes. When done, commit with a clear message and push to the current branch (\`${p.branch}\`):
+
+  git commit -am "Fix: <what you fixed>"
+  git push origin ${p.branch}
+
+The git remote is already authenticated.`;
+
+  const query = await getClaudeQuery();
+  const isRoot = process.getuid && process.getuid() === 0;
+  const conversation = query({
+    prompt,
+    options: {
+      cwd: dir,
+      ...(isRoot ? {} : { permissionMode: 'bypassPermissions' }),
+      allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'TodoRead', 'TodoWrite'],
+      maxTurns: 40,
+    },
+  });
+  for await (const ev of conversation) {
+    if (ev.type === 'result') console.error(`[dispatch] ${p.repo}#${p.pr_number} done (${ev.subtype || 'ok'})`);
+  }
+}
 
 // HTTP Basic Authentication (Optional)
 const AUTH_USERNAME = process.env.AUTH_USERNAME;
@@ -361,6 +453,86 @@ app.post('/api/tmux/pane/close', (req, res) => {
   }
 });
 
+// ==================== Session Management API ====================
+
+const sessionStore = new SessionStore();
+
+// List all sessions
+app.get('/api/sessions', (req, res) => {
+  try {
+    const userId = req.query.userId || undefined;
+    const sessions = sessionStore.listSessions(userId);
+    res.json({ sessions });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single session details
+app.get('/api/sessions/:id', (req, res) => {
+  try {
+    const meta = sessionStore.getSessionMeta(req.params.id);
+    if (!meta) return res.status(404).json({ error: 'Session not found' });
+    res.json(meta);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create a new session
+app.post('/api/sessions', (req, res) => {
+  try {
+    const { userId, title } = req.body || {};
+    const meta = sessionStore.createSession(userId || 'default', title || '');
+    res.status(201).json(meta);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Save (backup) a session from ~/.claude/ to persistent store
+app.post('/api/sessions/:id/save', (req, res) => {
+  try {
+    const meta = sessionStore.getSessionMeta(req.params.id);
+    if (!meta) return res.status(404).json({ error: 'Session not found' });
+
+    // Allow updating title on save
+    if (req.body && req.body.title) {
+      sessionStore.updateSessionMeta(req.params.id, { title: req.body.title });
+    }
+
+    const saved = sessionStore.saveSession(req.params.id);
+    if (!saved) return res.status(500).json({ error: 'Save failed' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Load (restore) a session from persistent store to ~/.claude/
+app.post('/api/sessions/:id/load', (req, res) => {
+  try {
+    const meta = sessionStore.getSessionMeta(req.params.id);
+    if (!meta) return res.status(404).json({ error: 'Session not found' });
+
+    const loaded = sessionStore.loadSession(req.params.id);
+    if (!loaded) return res.status(500).json({ error: 'Load failed' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a session
+app.delete('/api/sessions/:id', (req, res) => {
+  try {
+    sessionStore.deleteSession(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==================== Preview API ====================
 
 app.get('/api/ports', async (req, res) => {
@@ -466,6 +638,106 @@ server.on('upgrade', (req, socket, head) => {
     }
   }
 });
+
+// ==================== Agent SDK Chat Handler ====================
+
+async function handleChatMessage(ws, clientId, msg) {
+  const { sessionId, prompt } = msg;
+  if (!sessionId || !prompt) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'chat_error', sessionId, error: 'Missing sessionId or prompt' }));
+    }
+    return;
+  }
+
+  // Prevent concurrent queries on the same session
+  if (activeChatAborts.has(sessionId)) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'chat_error', sessionId, error: 'Session is busy' }));
+    }
+    return;
+  }
+
+  const meta = sessionStore.getSessionMeta(sessionId);
+  if (!meta) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'chat_error', sessionId, error: 'Session not found' }));
+    }
+    return;
+  }
+
+  // Restore session files so resume can find them
+  const isResume = !!meta.sdkSessionId;
+  if (isResume) {
+    sessionStore.loadSession(sessionId);
+  }
+
+  const abortController = new AbortController();
+  activeChatAborts.set(sessionId, { abortController, clientId });
+
+  try {
+    const query = await getClaudeQuery();
+
+    const isRoot = process.getuid && process.getuid() === 0;
+    const options = {
+      abortController,
+      cwd: WORKSPACE_DIR,
+      // bypassPermissions is blocked when running as root; fall back to default mode
+      ...(isRoot ? {} : { permissionMode: 'bypassPermissions' }),
+      allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Agent', 'TodoRead', 'TodoWrite', 'WebFetch', 'WebSearch', 'NotebookEdit'],
+      maxTurns: 30,
+    };
+
+    // Resume existing session using the SDK's session ID
+    if (isResume) {
+      options.resume = meta.sdkSessionId;
+    }
+
+    // SDK expects { prompt, options } as a single object argument
+    const conversation = query({ prompt, options });
+
+    for await (const event of conversation) {
+      if (ws.readyState !== WebSocket.OPEN) break;
+
+      // Capture SDK session ID from the first message that carries it
+      if (event.session_id && !meta.sdkSessionId) {
+        sessionStore.updateSessionMeta(sessionId, { sdkSessionId: event.session_id });
+        meta.sdkSessionId = event.session_id;
+      }
+
+      ws.send(JSON.stringify({
+        type: 'chat_message',
+        sessionId,
+        message: event,
+      }));
+    }
+
+    // Conversation round ended — send completion signal
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'chat_end', sessionId }));
+    }
+
+    // Auto-save after round completes
+    if (process.env.SESSION_AUTO_SAVE !== 'false') {
+      try { sessionStore.saveSession(sessionId); } catch (e) {
+        console.error(`Auto-save failed for session ${sessionId}:`, e.message);
+      }
+    }
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'chat_end', sessionId, aborted: true }));
+      }
+    } else {
+      console.error(`Chat error for session ${sessionId}:`, error.message);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'chat_error', sessionId, error: error.message }));
+      }
+    }
+  } finally {
+    activeChatAborts.delete(sessionId);
+  }
+}
 
 // WebSocket server for terminal connections
 const wss = new WebSocket.Server({ server, perMessageDeflate: false, clientTracking: true });
@@ -576,7 +848,8 @@ wss.on('connection', (ws, req) => {
     try {
       if (message.length > 1024 * 1024) return;
 
-      const { type, data } = JSON.parse(message);
+      const parsed = JSON.parse(message);
+      const { type, data } = parsed;
 
       switch (type) {
         case 'input':
@@ -600,6 +873,15 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({ type: 'pong' }));
           }
           break;
+        case 'chat':
+          handleChatMessage(ws, clientId, parsed);
+          break;
+        case 'chat_abort':
+          if (parsed.sessionId) {
+            const entry = activeChatAborts.get(parsed.sessionId);
+            if (entry) { entry.abortController.abort(); activeChatAborts.delete(parsed.sessionId); }
+          }
+          break;
       }
     } catch (error) {}
   });
@@ -611,6 +893,14 @@ wss.on('connection', (ws, req) => {
     if (activeClientId === id) activeClientId = null;
     const connection = connections.get(id);
     if (connection) {
+      // Abort only this client's active chat sessions
+      for (const [sid, entry] of activeChatAborts) {
+        if (entry.clientId === id) {
+          entry.abortController.abort();
+          activeChatAborts.delete(sid);
+        }
+      }
+
       if (TMUX_SESSION) {
         // Preserve tmux session on disconnect
       } else {
