@@ -233,7 +233,8 @@ CASE A — the issue asks for a CODE CHANGE you can make:
   A PR will be opened automatically.
 
 CASE B — the issue is a QUESTION, a status/progress request, a discussion, or otherwise needs NO code change (or you cannot make a meaningful change):
-  Do NOT commit anything. Instead, write your COMPLETE answer as your final message — it will be posted verbatim as a comment on the issue. Read the actual code/docs to ground your answer and reference specifics. Be concise and useful.
+  Do NOT commit anything. Instead, write your COMPLETE answer as your final message — it will be posted VERBATIM as a comment on the issue. Read the actual code/docs to ground your answer and reference specifics. Be concise and useful.
+  Your final message must contain ONLY the answer itself, written directly to the issue reader. NO preamble or meta-commentary — do not say things like "this is a question", "CASE B", "here is my answer", or describe what you are about to do. Start straight with the substantive response.
 
 Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final message is posted as an issue comment.`;
 
