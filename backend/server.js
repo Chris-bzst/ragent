@@ -70,17 +70,76 @@ app.post('/api/dispatch', express.raw({ type: '*/*', limit: '2mb' }), async (req
     return res.status(400).json({ error: 'malformed payload (repo/branch/pr_number)' });
   }
 
-  res.status(202).json({ accepted: true });
-  runDispatch(p).catch((e) => console.error('[dispatch] failed:', e.message));
+  const r = enqueueDispatch(p);
+  res.status(r.status === 'rejected' ? 429 : 202).json({ accepted: r.status !== 'rejected', ...r });
 });
 
-async function runDispatch(p) {
-  const dir = path.join(WORKSPACE_DIR, 'dispatch', `${p.repo.replace('/', '-')}-pr${p.pr_number}`);
-  const cloneUrl = `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${p.repo}.git`;
-  console.error(`[dispatch] ${p.repo}#${p.pr_number} → ${dir} (branch ${p.branch})`);
+// ── Dispatch scheduler: in-process semaphore + queue + per-PR dedup ─────────
+// Single Node process, so concurrency is a counter, not an external queue.
+// Default serial (DISPATCH_CONCURRENCY=1): one small container + one shared
+// Claude subscription rate limit — running fixes in parallel would double both
+// container pressure and subscription-rate burn (and could throttle the web
+// terminal, which shares the same OAuth session).
+const DISPATCH_MAX = Number(process.env.DISPATCH_CONCURRENCY || 1);
+const DISPATCH_QUEUE_MAX = Number(process.env.DISPATCH_QUEUE_MAX || 20);
+let dispatchActive = 0;
+const dispatchQueue = [];
+const dispatchInflight = new Set(); // "repo#pr" — dedup key (queued or running)
 
+function enqueueDispatch(p) {
+  const key = `${p.repo}#${p.pr_number}`;
+  if (dispatchInflight.has(key)) {
+    // Same PR already queued/running → keep newest payload (latest findings),
+    // don't schedule a duplicate run.
+    const q = dispatchQueue.find((j) => j.key === key);
+    if (q) q.payload = p;
+    console.error(`[dispatch] ${key} deduped (already in flight)`);
+    return { status: 'deduped', key };
+  }
+  if (dispatchQueue.length >= DISPATCH_QUEUE_MAX) {
+    console.error(`[dispatch] ${key} rejected (queue full: ${dispatchQueue.length})`);
+    return { status: 'rejected', reason: 'queue full', key };
+  }
+  dispatchInflight.add(key);
+  dispatchQueue.push({ key, payload: p });
+  console.error(`[dispatch] ${key} queued (active=${dispatchActive}/${DISPATCH_MAX}, depth=${dispatchQueue.length})`);
+  pumpDispatch();
+  return { status: 'queued', key, depth: dispatchQueue.length };
+}
+
+function pumpDispatch() {
+  while (dispatchActive < DISPATCH_MAX && dispatchQueue.length) {
+    const job = dispatchQueue.shift();
+    dispatchActive++;
+    runDispatch(job.payload)
+      .catch((e) => console.error(`[dispatch] ${job.key} failed:`, e.message))
+      .finally(() => { dispatchActive--; dispatchInflight.delete(job.key); pumpDispatch(); });
+  }
+}
+
+async function runDispatch(p) {
+  const slug = p.repo.replace('/', '-');
+  const cacheDir = path.join(WORKSPACE_DIR, 'dispatch', '.cache', slug);
+  const dir = path.join(WORKSPACE_DIR, 'dispatch', `${slug}-pr${p.pr_number}`);
+  const cloneUrl = `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${p.repo}.git`;
+  console.error(`[dispatch] ${p.repo}#${p.pr_number} → ${dir} (branch ${p.branch}, active=${dispatchActive})`);
+
+  // Per-repo cache clone, created once; subsequent dispatches only fetch the
+  // branch (incremental, reuses the object store) instead of re-downloading.
+  if (!fs.existsSync(path.join(cacheDir, '.git'))) {
+    execSync(`rm -rf '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
+    execSync(`mkdir -p '${shellEscape(path.dirname(cacheDir))}'`, { stdio: 'ignore' });
+    execSync(`git clone --filter=blob:none --no-checkout '${cloneUrl}' '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
+  }
+  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin '${cloneUrl}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags origin '${shellEscape(p.branch)}'`, { stdio: 'ignore' });
+
+  // Per-PR worktree off the shared cache: isolated working tree, near-zero disk
+  // (shares the cache object store), safe for concurrent PRs of the same repo.
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree prune`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}' 2>/dev/null || true`, { stdio: 'ignore', shell: '/bin/bash' });
   execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
-  execSync(`git clone --depth 1 -b '${shellEscape(p.branch)}' '${cloneUrl}' '${shellEscape(dir)}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree add --force -B '${shellEscape(p.branch)}' '${shellEscape(dir)}' 'origin/${shellEscape(p.branch)}'`, { stdio: 'ignore' });
   execSync(`git -C '${shellEscape(dir)}' config user.name '${shellEscape(DISPATCH_AUTHOR_NAME)}'`, { stdio: 'ignore' });
   if (DISPATCH_AUTHOR_EMAIL) execSync(`git -C '${shellEscape(dir)}' config user.email '${shellEscape(DISPATCH_AUTHOR_EMAIL)}'`, { stdio: 'ignore' });
 
@@ -117,6 +176,14 @@ The git remote is already authenticated.`;
   } catch (e) {
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
     throw e;
+  } finally {
+    // Release the worktree (and its disk) on every path; the cache object store
+    // is kept for the next dispatch of this repo.
+    try {
+      execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}'`, { stdio: 'ignore' });
+    } catch (_) {
+      execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
+    }
   }
 }
 
