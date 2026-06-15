@@ -100,19 +100,23 @@ Fix ONLY these reported issues in this repository. Do not make unrelated changes
 
 The git remote is already authenticated.`;
 
-  const query = await getClaudeQuery();
-  const isRoot = process.getuid && process.getuid() === 0;
-  const conversation = query({
-    prompt,
-    options: {
+  // Drive the Claude Code CLI in headless print mode (already installed in the
+  // container; the SDK npm package isn't in the production deps). Prompt via
+  // stdin; the CLI uses the container's existing Claude auth.
+  const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
+  try {
+    const out = execSync(`${claudeBin} -p --dangerously-skip-permissions`, {
       cwd: dir,
-      ...(isRoot ? {} : { permissionMode: 'bypassPermissions' }),
-      allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'TodoRead', 'TodoWrite'],
-      maxTurns: 40,
-    },
-  });
-  for await (const ev of conversation) {
-    if (ev.type === 'result') console.error(`[dispatch] ${p.repo}#${p.pr_number} done (${ev.subtype || 'ok'})`);
+      input: prompt,
+      env: { ...process.env, PATH: `/workspace/.local/bin:${process.env.PATH || ''}` },
+      timeout: 20 * 60 * 1000,
+      maxBuffer: 64 * 1024 * 1024,
+      encoding: 'utf8',
+    });
+    console.error(`[dispatch] ${p.repo}#${p.pr_number} claude finished: ${String(out).slice(-300)}`);
+  } catch (e) {
+    console.error(`[dispatch] ${p.repo}#${p.pr_number} claude error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
+    throw e;
   }
 }
 
