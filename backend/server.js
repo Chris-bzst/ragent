@@ -66,7 +66,14 @@ app.post('/api/dispatch', express.raw({ type: '*/*', limit: '2mb' }), async (req
 
   let p;
   try { p = JSON.parse(raw.toString('utf8')); } catch { return res.status(400).json({ error: 'invalid JSON' }); }
-  if (!/^[\w.-]+\/[\w.-]+$/.test(p.repo || '') || !/^[\w./-]+$/.test(p.branch || '') || !Number.isInteger(p.pr_number)) {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(p.repo || '')) {
+    return res.status(400).json({ error: 'malformed payload (repo)' });
+  }
+  if (p.kind === 'implement') {
+    if (!Number.isInteger(p.issue_number) || !/^[\w./-]+$/.test(p.base_branch || '')) {
+      return res.status(400).json({ error: 'malformed implement payload (issue_number/base_branch)' });
+    }
+  } else if (!/^[\w./-]+$/.test(p.branch || '') || !Number.isInteger(p.pr_number)) {
     return res.status(400).json({ error: 'malformed payload (repo/branch/pr_number)' });
   }
 
@@ -87,7 +94,7 @@ const dispatchQueue = [];
 const dispatchInflight = new Set(); // "repo#pr" — dedup key (queued or running)
 
 function enqueueDispatch(p) {
-  const key = `${p.repo}#${p.pr_number}`;
+  const key = p.kind === 'implement' ? `${p.repo}#issue-${p.issue_number}` : `${p.repo}#${p.pr_number}`;
   if (dispatchInflight.has(key)) {
     // Same PR already queued/running → keep newest payload (latest findings),
     // don't schedule a duplicate run.
@@ -111,7 +118,8 @@ function pumpDispatch() {
   while (dispatchActive < DISPATCH_MAX && dispatchQueue.length) {
     const job = dispatchQueue.shift();
     dispatchActive++;
-    runDispatch(job.payload)
+    const runner = job.payload.kind === 'implement' ? runImplement : runDispatch;
+    runner(job.payload)
       .catch((e) => console.error(`[dispatch] ${job.key} failed:`, e.message))
       .finally(() => { dispatchActive--; dispatchInflight.delete(job.key); pumpDispatch(); });
   }
@@ -185,6 +193,111 @@ The git remote is already authenticated.`;
       execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
     }
   }
+}
+
+// Origination path: implement an issue on a NEW branch and open a PR. The
+// existing deployment→acceptance loop then takes over on that PR.
+async function runImplement(p) {
+  const slug = p.repo.replace('/', '-');
+  const cacheDir = path.join(WORKSPACE_DIR, 'dispatch', '.cache', slug);
+  const base = p.base_branch || 'main';
+  const branch = `probe/issue-${p.issue_number}`;
+  const dir = path.join(WORKSPACE_DIR, 'dispatch', `${slug}-issue${p.issue_number}`);
+  const cloneUrl = `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${p.repo}.git`;
+  console.error(`[implement] ${p.repo} issue#${p.issue_number} → ${dir} (new branch ${branch} off ${base})`);
+
+  if (!fs.existsSync(path.join(cacheDir, '.git'))) {
+    execSync(`rm -rf '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
+    execSync(`mkdir -p '${shellEscape(path.dirname(cacheDir))}'`, { stdio: 'ignore' });
+    execSync(`git clone --filter=blob:none --no-checkout '${cloneUrl}' '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
+  }
+  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin '${cloneUrl}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags origin '${shellEscape(base)}'`, { stdio: 'ignore' });
+
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree prune`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}' 2>/dev/null || true`, { stdio: 'ignore', shell: '/bin/bash' });
+  execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree add --force -B '${shellEscape(branch)}' '${shellEscape(dir)}' 'origin/${shellEscape(base)}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(dir)}' config user.name '${shellEscape(DISPATCH_AUTHOR_NAME)}'`, { stdio: 'ignore' });
+  if (DISPATCH_AUTHOR_EMAIL) execSync(`git -C '${shellEscape(dir)}' config user.email '${shellEscape(DISPATCH_AUTHOR_EMAIL)}'`, { stdio: 'ignore' });
+
+  const prompt = `You are implementing a GitHub issue in this repository.
+
+ISSUE #${p.issue_number}: ${p.title}
+
+${p.body || '(no description provided)'}
+
+Implement the change that satisfies this issue. Make focused edits only — no unrelated changes. When done, commit your work (do NOT push and do NOT open a PR — that is handled for you):
+
+  git add -A && git commit -m "Implement: <what you did> (#${p.issue_number})"
+
+If the issue is too unclear to act on, make NO commit.`;
+
+  const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
+  try {
+    const out = execSync(`${claudeBin} -p --dangerously-skip-permissions`, {
+      cwd: dir,
+      input: prompt,
+      env: { ...process.env, PATH: `/workspace/.local/bin:${process.env.PATH || ''}` },
+      timeout: 20 * 60 * 1000,
+      maxBuffer: 64 * 1024 * 1024,
+      encoding: 'utf8',
+    });
+    console.error(`[implement] issue#${p.issue_number} claude finished: ${String(out).slice(-300)}`);
+
+    const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(base)}..HEAD'`, { encoding: 'utf8' }).trim();
+    if (ahead === '0' || ahead === '') {
+      console.error(`[implement] issue#${p.issue_number}: no commits produced — no PR opened`);
+      return;
+    }
+    execSync(`git -C '${shellEscape(dir)}' push --force origin '${shellEscape(branch)}'`, { stdio: 'ignore' });
+    await openPullRequest(p, branch, base);
+  } catch (e) {
+    console.error(`[implement] issue#${p.issue_number} error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
+    throw e;
+  } finally {
+    try {
+      execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}'`, { stdio: 'ignore' });
+    } catch (_) {
+      execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
+    }
+  }
+}
+
+// Open a PR via the GitHub API (https module — works on node 16+). Idempotent:
+// a 422 (PR already exists for this head) on a re-run is fine.
+function openPullRequest(p, head, base) {
+  const https = require('https');
+  const payload = JSON.stringify({
+    title: p.title || `Implement issue #${p.issue_number}`,
+    head, base,
+    body: `Implements #${p.issue_number}.\n\nCloses #${p.issue_number}\n\n— generated by Ragent from the issue; Probe will verify the preview.`,
+  });
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.github.com', path: `/repos/${p.repo}/pulls`, method: 'POST',
+      headers: {
+        Authorization: `Bearer ${DISPATCH_GH_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'ragent-dispatch',
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    }, (res) => {
+      let body = ''; res.on('data', (c) => (body += c)); res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          let num; try { num = JSON.parse(body).number; } catch (_) {}
+          console.error(`[implement] issue#${p.issue_number} → opened PR #${num} (${head} → ${base})`);
+        } else {
+          console.error(`[implement] issue#${p.issue_number} open PR → ${res.statusCode}: ${body.slice(0, 200)}`);
+        }
+        resolve();
+      });
+    });
+    req.on('error', (e) => { console.error(`[implement] open PR error: ${e.message}`); resolve(); });
+    req.write(payload); req.end();
+  });
 }
 
 // HTTP Basic Authentication (Optional)
