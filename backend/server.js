@@ -221,17 +221,21 @@ async function runImplement(p) {
   execSync(`git -C '${shellEscape(dir)}' config user.name '${shellEscape(DISPATCH_AUTHOR_NAME)}'`, { stdio: 'ignore' });
   if (DISPATCH_AUTHOR_EMAIL) execSync(`git -C '${shellEscape(dir)}' config user.email '${shellEscape(DISPATCH_AUTHOR_EMAIL)}'`, { stdio: 'ignore' });
 
-  const prompt = `You are implementing a GitHub issue in this repository.
+  const prompt = `You are responding to a GitHub issue in this repository. Decide which case applies:
 
 ISSUE #${p.issue_number}: ${p.title}
 
 ${p.body || '(no description provided)'}
 
-Implement the change that satisfies this issue. Make focused edits only — no unrelated changes. When done, commit your work (do NOT push and do NOT open a PR — that is handled for you):
+CASE A — the issue asks for a CODE CHANGE you can make:
+  Implement it (focused edits only, no unrelated changes), then commit (do NOT push, do NOT open a PR — that is handled for you):
+    git add -A && git commit -m "Implement: <what you did> (#${p.issue_number})"
+  A PR will be opened automatically.
 
-  git add -A && git commit -m "Implement: <what you did> (#${p.issue_number})"
+CASE B — the issue is a QUESTION, a status/progress request, a discussion, or otherwise needs NO code change (or you cannot make a meaningful change):
+  Do NOT commit anything. Instead, write your COMPLETE answer as your final message — it will be posted verbatim as a comment on the issue. Read the actual code/docs to ground your answer and reference specifics. Be concise and useful.
 
-If the issue is too unclear to act on, make NO commit.`;
+Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final message is posted as an issue comment.`;
 
   const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
   try {
@@ -247,7 +251,11 @@ If the issue is too unclear to act on, make NO commit.`;
 
     const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(base)}..HEAD'`, { encoding: 'utf8' }).trim();
     if (ahead === '0' || ahead === '') {
-      console.error(`[implement] issue#${p.issue_number}: no commits produced — no PR opened`);
+      // No code change (Case B: question / status / can't act) → reply on the
+      // issue with the agent's final message instead of opening an empty PR.
+      console.error(`[implement] issue#${p.issue_number}: no commits → replying as issue comment`);
+      const reply = String(out || '').trim() || '(the agent produced no actionable change and no response)';
+      await postIssueComment(p, reply);
       return;
     }
     execSync(`git -C '${shellEscape(dir)}' push --force origin '${shellEscape(branch)}'`, { stdio: 'ignore' });
@@ -262,6 +270,34 @@ If the issue is too unclear to act on, make NO commit.`;
       execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
     }
   }
+}
+
+// Post a comment on the issue (Case B: question/status, no PR). https module.
+function postIssueComment(p, body) {
+  const https = require('https');
+  const capped = body.length > 60000 ? body.slice(0, 60000) + '\n\n…(truncated)' : body;
+  const payload = JSON.stringify({ body: `${capped}\n\n— 🤖 Ragent (replied to #${p.issue_number}; no code change needed)` });
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.github.com', path: `/repos/${p.repo}/issues/${p.issue_number}/comments`, method: 'POST',
+      headers: {
+        Authorization: `Bearer ${DISPATCH_GH_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'ragent-dispatch',
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    }, (res) => {
+      let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) console.error(`[implement] issue#${p.issue_number} → posted reply comment`);
+        else console.error(`[implement] issue#${p.issue_number} comment → ${res.statusCode}: ${b.slice(0, 200)}`);
+        resolve();
+      });
+    });
+    req.on('error', (e) => { console.error(`[implement] comment error: ${e.message}`); resolve(); });
+    req.write(payload); req.end();
+  });
 }
 
 // Open a PR via the GitHub API (https module — works on node 16+). Idempotent:
