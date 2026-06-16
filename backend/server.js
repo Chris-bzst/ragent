@@ -5,7 +5,7 @@ const pty = require('node-pty');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { execSync, exec } = require('child_process');
+const { execSync, exec, spawn } = require('child_process');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const { detectOpenPorts, isValidPort, isBlockedPort } = require('./utils/port-detection');
 const SessionStore = require('./utils/session-store');
@@ -133,6 +133,34 @@ function pumpDispatch() {
   }
 }
 
+// Run `claude -p` ASYNCHRONOUSLY (spawn, not execSync) so it never blocks the
+// Node event loop. This process also serves the web terminal (WebSocket + pty);
+// a synchronous multi-minute dispatch would freeze it for the whole run. Writes
+// the prompt to stdin, resolves stdout; rejects on non-zero exit (with .stdout
+// attached, matching the old execSync error shape) or a 20-minute timeout.
+function runClaudeP(prompt, cwd) {
+  const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
+  return new Promise((resolve, reject) => {
+    const child = spawn(claudeBin, ['-p', '--dangerously-skip-permissions'], {
+      cwd,
+      env: { ...process.env, PATH: `/workspace/.local/bin:${process.env.PATH || ''}` },
+    });
+    let out = '', err = '';
+    const MAX = 64 * 1024 * 1024;
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} reject(new Error('claude -p timed out (20m)')); }, 20 * 60 * 1000);
+    child.stdout.on('data', (d) => { out += d; if (out.length > MAX) out = out.slice(-MAX); });
+    child.stderr.on('data', (d) => { err += d; if (err.length > MAX) err = err.slice(-MAX); });
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) return resolve(out);
+      const e = new Error(`claude -p exited with code ${code}`); e.stdout = out; e.stderr = err; reject(e);
+    });
+    child.stdin.on('error', () => {}); // ignore EPIPE if the child exits early
+    child.stdin.write(prompt); child.stdin.end();
+  });
+}
+
 async function runDispatch(p) {
   const slug = p.repo.replace('/', '-');
   const cacheDir = path.join(WORKSPACE_DIR, 'dispatch', '.cache', slug);
@@ -180,14 +208,7 @@ The git remote is already authenticated.`;
   // stdin; the CLI uses the container's existing Claude auth.
   const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
   try {
-    const out = execSync(`${claudeBin} -p --dangerously-skip-permissions`, {
-      cwd: dir,
-      input: prompt,
-      env: { ...process.env, PATH: `/workspace/.local/bin:${process.env.PATH || ''}` },
-      timeout: 20 * 60 * 1000,
-      maxBuffer: 64 * 1024 * 1024,
-      encoding: 'utf8',
-    });
+    const out = await runClaudeP(prompt, dir);
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude finished: ${String(out).slice(-300)}`);
   } catch (e) {
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
@@ -248,14 +269,7 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
 
   const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
   try {
-    const out = execSync(`${claudeBin} -p --dangerously-skip-permissions`, {
-      cwd: dir,
-      input: prompt,
-      env: { ...process.env, PATH: `/workspace/.local/bin:${process.env.PATH || ''}` },
-      timeout: 20 * 60 * 1000,
-      maxBuffer: 64 * 1024 * 1024,
-      encoding: 'utf8',
-    });
+    const out = await runClaudeP(prompt, dir);
     console.error(`[implement] issue#${p.issue_number} claude finished: ${String(out).slice(-300)}`);
 
     const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(base)}..HEAD'`, { encoding: 'utf8' }).trim();
@@ -380,14 +394,7 @@ ${p.request || '(see the latest comment above)'}
 Write your reply to the latest request. Read code/docs as needed to be specific and correct. Output ONLY the reply itself — no preamble, no meta-commentary. Be concise.`;
 
     const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
-    const out = execSync(`${claudeBin} -p --dangerously-skip-permissions`, {
-      cwd: dir,
-      input: prompt,
-      env: { ...process.env, PATH: `/workspace/.local/bin:${process.env.PATH || ''}` },
-      timeout: 20 * 60 * 1000,
-      maxBuffer: 64 * 1024 * 1024,
-      encoding: 'utf8',
-    });
+    const out = await runClaudeP(prompt, dir);
     const reply = String(out || '').trim() || '(no response generated)';
     await postIssueComment(p, reply, `replied to #${p.issue_number}`);
     console.error(`[converse] issue#${p.issue_number} replied`);
