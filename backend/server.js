@@ -73,6 +73,10 @@ app.post('/api/dispatch', express.raw({ type: '*/*', limit: '2mb' }), async (req
     if (!Number.isInteger(p.issue_number) || !/^[\w./-]+$/.test(p.base_branch || '')) {
       return res.status(400).json({ error: 'malformed implement payload (issue_number/base_branch)' });
     }
+  } else if (p.kind === 'converse') {
+    if (!Number.isInteger(p.issue_number)) {
+      return res.status(400).json({ error: 'malformed converse payload (issue_number)' });
+    }
   } else if (!/^[\w./-]+$/.test(p.branch || '') || !Number.isInteger(p.pr_number)) {
     return res.status(400).json({ error: 'malformed payload (repo/branch/pr_number)' });
   }
@@ -94,7 +98,9 @@ const dispatchQueue = [];
 const dispatchInflight = new Set(); // "repo#pr" — dedup key (queued or running)
 
 function enqueueDispatch(p) {
-  const key = p.kind === 'implement' ? `${p.repo}#issue-${p.issue_number}` : `${p.repo}#${p.pr_number}`;
+  const key = p.kind === 'implement' ? `${p.repo}#issue-${p.issue_number}`
+    : p.kind === 'converse' ? `${p.repo}#issue-${p.issue_number}#c${p.comment_id || Date.now()}`
+    : `${p.repo}#${p.pr_number}`;
   if (dispatchInflight.has(key)) {
     // Same PR already queued/running → keep newest payload (latest findings),
     // don't schedule a duplicate run.
@@ -118,7 +124,9 @@ function pumpDispatch() {
   while (dispatchActive < DISPATCH_MAX && dispatchQueue.length) {
     const job = dispatchQueue.shift();
     dispatchActive++;
-    const runner = job.payload.kind === 'implement' ? runImplement : runDispatch;
+    const runner = job.payload.kind === 'implement' ? runImplement
+      : job.payload.kind === 'converse' ? runConverse
+      : runDispatch;
     runner(job.payload)
       .catch((e) => console.error(`[dispatch] ${job.key} failed:`, e.message))
       .finally(() => { dispatchActive--; dispatchInflight.delete(job.key); pumpDispatch(); });
@@ -256,7 +264,7 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
       // issue with the agent's final message instead of opening an empty PR.
       console.error(`[implement] issue#${p.issue_number}: no commits → replying as issue comment`);
       const reply = String(out || '').trim() || '(the agent produced no actionable change and no response)';
-      await postIssueComment(p, reply);
+      await postIssueComment(p, reply, `replied to #${p.issue_number}; no code change needed`);
       return;
     }
     execSync(`git -C '${shellEscape(dir)}' push --force origin '${shellEscape(branch)}'`, { stdio: 'ignore' });
@@ -274,10 +282,11 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
 }
 
 // Post a comment on the issue (Case B: question/status, no PR). https module.
-function postIssueComment(p, body) {
+function postIssueComment(p, body, footer) {
   const https = require('https');
   const capped = body.length > 60000 ? body.slice(0, 60000) + '\n\n…(truncated)' : body;
-  const payload = JSON.stringify({ body: `${capped}\n\n— 🤖 Ragent (replied to #${p.issue_number}; no code change needed)` });
+  const note = footer || `replied to #${p.issue_number}`;
+  const payload = JSON.stringify({ body: `${capped}\n\n— 🤖 Ragent (${note})` });
   return new Promise((resolve) => {
     const req = https.request({
       hostname: 'api.github.com', path: `/repos/${p.repo}/issues/${p.issue_number}/comments`, method: 'POST',
@@ -334,6 +343,93 @@ function openPullRequest(p, head, base) {
     });
     req.on('error', (e) => { console.error(`[implement] open PR error: ${e.message}`); resolve(); });
     req.write(payload); req.end();
+  });
+}
+
+// Conversation path: read the repo + the whole issue thread, answer the latest
+// "/ragent" request as an issue comment. No commit, no PR — read-only worktree.
+async function runConverse(p) {
+  const slug = p.repo.replace('/', '-');
+  const cacheDir = path.join(WORKSPACE_DIR, 'dispatch', '.cache', slug);
+  const dir = path.join(WORKSPACE_DIR, 'dispatch', `${slug}-converse-${p.issue_number}`);
+  const cloneUrl = `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${p.repo}.git`;
+  console.error(`[converse] ${p.repo} issue#${p.issue_number} → reading repo + thread`);
+
+  if (!fs.existsSync(path.join(cacheDir, '.git'))) {
+    execSync(`rm -rf '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
+    execSync(`mkdir -p '${shellEscape(path.dirname(cacheDir))}'`, { stdio: 'ignore' });
+    execSync(`git clone --filter=blob:none --no-checkout '${cloneUrl}' '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
+  }
+  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin '${cloneUrl}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags origin HEAD`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree prune`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}' 2>/dev/null || true`, { stdio: 'ignore', shell: '/bin/bash' });
+  execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' worktree add --force --detach '${shellEscape(dir)}' FETCH_HEAD`, { stdio: 'ignore' });
+
+  try {
+    const thread = await getIssueThread(p);
+    const threadText = thread.map((c) => `[@${c.author}]: ${c.body}`).join('\n\n---\n\n');
+    const prompt = `You are taking part in an ongoing discussion on a GitHub issue in this repository. Read the repo (code/docs) to ground your answer.
+
+ISSUE #${p.issue_number}: ${p.title}
+
+${p.body || '(no description)'}
+
+--- CONVERSATION SO FAR (oldest first) ---
+${threadText || '(no prior comments)'}
+
+--- LATEST REQUEST (respond to this) ---
+${p.request || '(see the latest comment above)'}
+
+Write your reply to the latest request. Read code/docs as needed to be specific and correct. Output ONLY the reply itself — no preamble, no meta-commentary. Be concise.`;
+
+    const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
+    const out = execSync(`${claudeBin} -p --dangerously-skip-permissions`, {
+      cwd: dir,
+      input: prompt,
+      env: { ...process.env, PATH: `/workspace/.local/bin:${process.env.PATH || ''}` },
+      timeout: 20 * 60 * 1000,
+      maxBuffer: 64 * 1024 * 1024,
+      encoding: 'utf8',
+    });
+    const reply = String(out || '').trim() || '(no response generated)';
+    await postIssueComment(p, reply, `replied to #${p.issue_number}`);
+    console.error(`[converse] issue#${p.issue_number} replied`);
+  } catch (e) {
+    console.error(`[converse] issue#${p.issue_number} error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-200) : ''}`);
+    throw e;
+  } finally {
+    try {
+      execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}'`, { stdio: 'ignore' });
+    } catch (_) {
+      execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
+    }
+  }
+}
+
+// Fetch the issue's comment thread (https GET). Returns [{author, body}] oldest-first.
+function getIssueThread(p) {
+  const https = require('https');
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.github.com', path: `/repos/${p.repo}/issues/${p.issue_number}/comments?per_page=100`, method: 'GET',
+      headers: {
+        Authorization: `Bearer ${DISPATCH_GH_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'ragent-dispatch',
+      },
+    }, (res) => {
+      let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => {
+        try {
+          const arr = JSON.parse(b);
+          resolve(Array.isArray(arr) ? arr.map((c) => ({ author: c.user && c.user.login, body: c.body || '' })) : []);
+        } catch (_) { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.end();
   });
 }
 
