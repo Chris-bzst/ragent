@@ -129,17 +129,36 @@ app.post('/webhooks/github', express.raw({ type: '*/*', limit: '2mb' }), (req, r
     } else if (event === 'issue_comment') {
       if (pl.action !== 'created') return;
       const issue = pl.issue;
-      if (!issue || issue.pull_request) return;            // PR comments are Probe's (/probe)
+      if (!issue) return;
       const body = String((pl.comment && pl.comment.body) || '');
       if (/🤖 Ragent/.test(body)) return;                   // never answer our own reply
       const m = body.match(/^\s*\/ragent\b[ \t]*([\s\S]*)$/i);
       if (!m) return;
-      enqueueDispatch({
-        kind: 'converse', repo, issue_number: issue.number,
-        comment_id: (pl.comment && pl.comment.id) || 0,
-        title: issue.title || '', body: issue.body || '',
-        request: (m[1] || '').trim(),
-      });
+      const request = (m[1] || '').trim();
+      if (issue.pull_request) {
+        // /ragent on a PR → MANUAL fix request on the PR branch. The manual
+        // counterpart to Probe's automatic verdict→fix — needed when the
+        // automated loop can't help (e.g. the preview build FAILED, so Probe
+        // never gets a deployment_status=success to verify). Resolve the PR's
+        // head branch, then dispatch a fix carrying the user's instruction.
+        getPullBranch(repo, issue.number).then((branch) => {
+          if (!branch) { console.error(`[webhook] PR #${issue.number}: could not resolve head branch`); return; }
+          enqueueDispatch({
+            kind: 'fix', repo, pr_number: issue.number, branch,
+            head_sha: '', target_url: '', round: 0,
+            summary: request || 'User asked Ragent to fix this PR.',
+            findings: [{ severity: 'high', title: request || 'Fix the reported problem on this PR.', detail: '', repro_steps: [] }],
+          });
+        }).catch((e) => console.error('[webhook] PR fix error:', e.message));
+      } else {
+        // /ragent on an issue → conversation.
+        enqueueDispatch({
+          kind: 'converse', repo, issue_number: issue.number,
+          comment_id: (pl.comment && pl.comment.id) || 0,
+          title: issue.title || '', body: issue.body || '',
+          request,
+        });
+      }
     }
   } catch (e) {
     console.error('[webhook] handler error:', e.message);
@@ -469,6 +488,29 @@ Write your reply to the latest request. Read code/docs as needed to be specific 
       execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
     }
   }
+}
+
+// Resolve a PR's head branch name (https GET) — needed to fix the right branch
+// when a /ragent fix request comes in on a PR.
+function getPullBranch(repo, prNumber) {
+  const https = require('https');
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.github.com', path: `/repos/${repo}/pulls/${prNumber}`, method: 'GET',
+      headers: {
+        Authorization: `Bearer ${DISPATCH_GH_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'ragent-dispatch',
+      },
+    }, (res) => {
+      let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => {
+        try { const pr = JSON.parse(b); resolve(pr && pr.head && pr.head.ref); } catch (_) { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
 }
 
 // Fetch the issue's comment thread (https GET). Returns [{author, body}] oldest-first.
