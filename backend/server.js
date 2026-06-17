@@ -85,6 +85,67 @@ app.post('/api/dispatch', express.raw({ type: '*/*', limit: '2mb' }), async (req
   res.status(r.status === 'rejected' ? 429 : 202).json({ accepted: r.status !== 'rejected', ...r });
 });
 
+// ── GitHub webhook: Ragent owns the issue surface (origination + conversation) ──
+// Probe (the acceptance agent) no longer routes issue events; Ragent receives
+// them directly here. `issues` (labeled with the trigger label) → implement;
+// `issue_comment` starting with "/ragent" on a real issue → converse. PR-comment
+// `/probe` adjudication and deployment_status stay on Probe's own webhook.
+const WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
+const ISSUE_LABEL = process.env.DISPATCH_ISSUE_LABEL || 'agent';
+
+app.post('/webhooks/github', express.raw({ type: '*/*', limit: '2mb' }), (req, res) => {
+  if (!WEBHOOK_SECRET || !DISPATCH_GH_TOKEN) {
+    return res.status(503).json({ error: 'webhook not configured (set GITHUB_WEBHOOK_SECRET + DISPATCH_GITHUB_TOKEN)' });
+  }
+  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+  const sig = req.headers['x-hub-signature-256'];
+  const expected = 'sha256=' + crypto.createHmac('sha256', WEBHOOK_SECRET).update(raw).digest('hex');
+  const ok = typeof sig === 'string' && sig.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  if (!ok) return res.status(401).json({ error: 'invalid signature' });
+
+  const event = req.headers['x-github-event'];
+  let pl;
+  try { pl = JSON.parse(raw.toString('utf8')); } catch { return res.status(400).json({ error: 'invalid JSON' }); }
+  res.status(202).json({ accepted: true });
+
+  try {
+    const repo = pl.repository && pl.repository.full_name;
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo || '')) return;
+
+    if (event === 'issues') {
+      const issue = pl.issue;
+      if (!issue || issue.pull_request) return;            // PRs arrive as issues — not ours
+      if (pl.action !== 'opened' && pl.action !== 'labeled') return;
+      const hasLabel = pl.action === 'labeled'
+        ? (pl.label && pl.label.name === ISSUE_LABEL)
+        : (issue.labels || []).some((l) => l && l.name === ISSUE_LABEL);
+      if (!hasLabel) return;
+      enqueueDispatch({
+        kind: 'implement', repo, issue_number: issue.number,
+        title: issue.title || '', body: issue.body || '',
+        base_branch: (pl.repository && pl.repository.default_branch) || 'main',
+      });
+    } else if (event === 'issue_comment') {
+      if (pl.action !== 'created') return;
+      const issue = pl.issue;
+      if (!issue || issue.pull_request) return;            // PR comments are Probe's (/probe)
+      const body = String((pl.comment && pl.comment.body) || '');
+      if (/🤖 Ragent/.test(body)) return;                   // never answer our own reply
+      const m = body.match(/^\s*\/ragent\b[ \t]*([\s\S]*)$/i);
+      if (!m) return;
+      enqueueDispatch({
+        kind: 'converse', repo, issue_number: issue.number,
+        comment_id: (pl.comment && pl.comment.id) || 0,
+        title: issue.title || '', body: issue.body || '',
+        request: (m[1] || '').trim(),
+      });
+    }
+  } catch (e) {
+    console.error('[webhook] handler error:', e.message);
+  }
+});
+
 // ── Dispatch scheduler: in-process semaphore + queue + per-PR dedup ─────────
 // Single Node process, so concurrency is a counter, not an external queue.
 // Default serial (DISPATCH_CONCURRENCY=1): one small container + one shared
