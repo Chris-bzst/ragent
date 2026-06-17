@@ -471,13 +471,38 @@ ${threadText || '(no prior comments)'}
 --- LATEST REQUEST (respond to this) ---
 ${p.request || '(see the latest comment above)'}
 
-Write your reply to the latest request. Read code/docs as needed to be specific and correct. Output ONLY the reply itself — no preamble, no meta-commentary. Be concise.`;
+Write your reply to the latest request. Read code/docs as needed to be specific and correct. Be concise.
+
+If — and ONLY if — the user asks you to open a new development issue (e.g. "open an issue to build X", "把这个开成开发 issue"), append at the VERY END of your reply this exact fenced block (nothing after it):
+
+\`\`\`ragent:open-issue
+TITLE: <a concise issue title>
+BODY: <a clear, self-contained spec a coding agent can implement directly — what to build, acceptance criteria, relevant files/paths>
+\`\`\`
+
+Otherwise output ONLY the reply itself — no preamble, no meta-commentary, no block.`;
 
     const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
     const out = await runClaudeP(prompt, dir);
-    const reply = String(out || '').trim() || '(no response generated)';
+    let reply = String(out || '').trim() || '(no response generated)';
+
+    // Spin-off: if the agent emitted a ragent:open-issue block, open a new
+    // development issue (auto-labeled so Ragent's own webhook then implements it),
+    // strip the block from the reply, and link the new issue.
+    const blk = reply.match(/```ragent:open-issue\s*([\s\S]*?)```/i);
+    if (blk) {
+      const t = blk[1].match(/TITLE:\s*(.+)/i);
+      const b = blk[1].match(/BODY:\s*([\s\S]*)/i);
+      const title = (t && t[1].trim()) || `Task from #${p.issue_number}`;
+      const issueBody = ((b && b[1].trim()) || '') + `\n\n— spun off from #${p.issue_number} by 🤖 Ragent`;
+      reply = reply.replace(blk[0], '').trim();
+      const num = await openIssue(p.repo, title, issueBody, [ISSUE_LABEL]);
+      reply += num
+        ? `\n\n📋 已开 #${num}（已打 \`${ISSUE_LABEL}\` label，将自动实现）。`
+        : `\n\n⚠️ 想开发开 issue，但创建失败了（token 需 Issues:write，label \`${ISSUE_LABEL}\` 需存在）。`;
+    }
     await postIssueComment(p, reply, `replied to #${p.issue_number}`);
-    console.error(`[converse] issue#${p.issue_number} replied`);
+    console.error(`[converse] issue#${p.issue_number} replied${blk ? ' (+ spun off issue)' : ''}`);
   } catch (e) {
     console.error(`[converse] issue#${p.issue_number} error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-200) : ''}`);
     throw e;
@@ -488,6 +513,20 @@ Write your reply to the latest request. Read code/docs as needed to be specific 
       execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
     }
   }
+}
+
+// Open a new issue (spin-off from a discussion). Labels are applied at creation
+// so Ragent's own webhook picks it up and implements it. Returns the number.
+async function openIssue(repo, title, body, labels) {
+  const payload = JSON.stringify({ title, body, labels: labels || [] });
+  const r = await githubPost(`/repos/${repo}/issues`, payload);
+  if (r.ok) {
+    let num; try { num = JSON.parse(r.body).number; } catch (_) {}
+    console.error(`[converse] spun off issue #${num} on ${repo} (labels: ${(labels || []).join(',')})`);
+    return num;
+  }
+  console.error(`[converse] open issue failed → ${r.status || r.error}: ${(r.body || '').slice(0, 200)}`);
+  return null;
 }
 
 // Resolve a PR's head branch name (https GET) — needed to fix the right branch
