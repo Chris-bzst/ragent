@@ -6,6 +6,7 @@
     <title>Ragent</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
     <link rel="stylesheet" href="styles/preview.css" />
+    <link rel="stylesheet" href="styles/session.css" />
     <style>
         :root {
             --header-height: 60px;
@@ -220,7 +221,11 @@
 </head>
 <body>
     <div class="header">
-        <h1>Ragent</h1>
+        <div style="display:flex;align-items:center;">
+            <h1>Ragent</h1>
+            <button class="header-session-btn" id="session-panel-btn">Sessions</button>
+            <span class="header-chat-indicator" id="chat-indicator"></span>
+        </div>
         <div style="display:flex;align-items:center;gap:8px;">
             <div class="font-controls">
                 <button class="font-btn" id="font-dec-btn" title="Smaller font" aria-label="Decrease font size">A&minus;</button>
@@ -306,6 +311,34 @@
             <button class="selection-btn selection-close" id="paste-overlay-close">Cancel</button>
         </div>
         <textarea class="paste-overlay-textarea" id="paste-overlay-textarea" placeholder="Tap here and paste (Cmd+V or long press)" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+    </div>
+
+    <!-- Session List Panel -->
+    <div class="session-panel" id="session-panel">
+        <div class="session-panel-header">
+            <span class="session-panel-title">Sessions</span>
+            <div class="session-panel-actions">
+                <button class="session-btn" id="session-new-btn">+ New</button>
+                <button class="session-btn session-btn-close" id="session-panel-close">Close</button>
+            </div>
+        </div>
+        <div class="session-list" id="session-list">
+            <div class="session-empty">No sessions yet. Create one to start chatting.</div>
+        </div>
+    </div>
+
+    <!-- Chat Panel -->
+    <div class="chat-panel" id="chat-panel">
+        <div class="chat-panel-header">
+            <span class="chat-panel-title" id="chat-panel-title">Chat</span>
+            <button class="chat-panel-close" id="chat-panel-close">&times;</button>
+        </div>
+        <div class="chat-messages" id="chat-messages"></div>
+        <div class="chat-typing" id="chat-typing">Agent is thinking...</div>
+        <div class="chat-input-area">
+            <textarea class="chat-input" id="chat-input" placeholder="Send a message..." rows="1" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+            <button class="chat-send-btn" id="chat-send-btn">Send</button>
+        </div>
     </div>
 
     <div class="toast" id="toast"></div>

@@ -63,6 +63,8 @@ class WebClaudeCode {
         this.setupSelectionOverlay();
         this.setupPasteOverlay();
         this.setupImagePaste();
+        this.setupSessionPanel();
+        this.setupChatPanel();
         this.setupFontControls();
     }
 
@@ -224,6 +226,15 @@ class WebClaudeCode {
                     case 'exit':
                         this.terminal.writeln(`\r\n\x1b[31mProcess exited with code ${message.exitCode}\x1b[0m`);
                         this.updateStatus('Disconnected', '#f44747');
+                        break;
+                    case 'chat_message':
+                        this.handleChatEvent(message);
+                        break;
+                    case 'chat_end':
+                        this.onChatEnd(message);
+                        break;
+                    case 'chat_error':
+                        this.onChatError(message);
                         break;
                 }
             } catch (error) {
@@ -882,6 +893,292 @@ class WebClaudeCode {
         } finally {
             this.isUploadingImage = false;
         }
+    }
+
+    // ==================== Session Panel ====================
+
+    setupSessionPanel() {
+        this.activeSessionId = null;
+        this.chatBusy = false;
+
+        const panelBtn = document.getElementById('session-panel-btn');
+        const panel = document.getElementById('session-panel');
+        const closeBtn = document.getElementById('session-panel-close');
+        const newBtn = document.getElementById('session-new-btn');
+
+        if (!panelBtn || !panel) return;
+
+        panelBtn.addEventListener('click', () => {
+            panel.classList.add('open');
+            this.refreshSessionList();
+        });
+
+        closeBtn?.addEventListener('click', () => {
+            panel.classList.remove('open');
+            if (this.terminal) this.terminal.focus();
+        });
+
+        newBtn?.addEventListener('click', async () => {
+            try {
+                const title = prompt('Session name (optional):') || '';
+                const resp = await fetch('/api/sessions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ title }),
+                });
+                if (!resp.ok) throw new Error('Failed to create session');
+                const meta = await resp.json();
+                this.activeSessionId = meta.sessionId;
+                panel.classList.remove('open');
+                this.openChatPanel(meta);
+            } catch (err) {
+                this.showToast(err.message || 'Create failed');
+            }
+        });
+
+        // ESC to close
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && panel.classList.contains('open')) {
+                panel.classList.remove('open');
+            }
+        });
+    }
+
+    async refreshSessionList() {
+        const listEl = document.getElementById('session-list');
+        if (!listEl) return;
+
+        try {
+            const resp = await fetch('/api/sessions');
+            const data = await resp.json();
+            const sessions = data.sessions || [];
+
+            if (sessions.length === 0) {
+                listEl.innerHTML = '<div class="session-empty">No sessions yet. Create one to start chatting.</div>';
+                return;
+            }
+
+            listEl.innerHTML = sessions.map(s => {
+                const date = new Date(s.lastActive);
+                const timeStr = date.toLocaleString();
+                const escapedId = this.escapeHtml(s.sessionId);
+                return `
+                    <div class="session-item" data-session-id="${escapedId}">
+                        <div class="session-item-info">
+                            <div class="session-item-title">${this.escapeHtml(s.title)}</div>
+                            <div class="session-item-meta">${timeStr} &middot; ${escapedId.slice(0, 8)}</div>
+                        </div>
+                        <button class="session-item-delete" data-delete-id="${escapedId}" title="Delete">&times;</button>
+                    </div>
+                `;
+            }).join('');
+
+            // Click to open session
+            listEl.querySelectorAll('.session-item').forEach(el => {
+                el.addEventListener('click', (e) => {
+                    if (e.target.closest('.session-item-delete')) return;
+                    const sid = el.dataset.sessionId;
+                    const session = sessions.find(s => s.sessionId === sid);
+                    if (session) {
+                        this.activeSessionId = sid;
+                        document.getElementById('session-panel')?.classList.remove('open');
+                        this.openChatPanel(session);
+                    }
+                });
+            });
+
+            // Delete buttons
+            listEl.querySelectorAll('.session-item-delete').forEach(btn => {
+                btn.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    const sid = btn.dataset.deleteId;
+                    if (!confirm('Delete this session?')) return;
+                    try {
+                        await fetch(`/api/sessions/${sid}`, { method: 'DELETE' });
+                        if (this.activeSessionId === sid) {
+                            this.activeSessionId = null;
+                            document.getElementById('chat-panel')?.classList.remove('open');
+                        }
+                        this.refreshSessionList();
+                    } catch (err) {
+                        this.showToast('Delete failed');
+                    }
+                });
+            });
+        } catch (err) {
+            listEl.innerHTML = '<div class="session-empty">Failed to load sessions.</div>';
+        }
+    }
+
+    escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    // ==================== Chat Panel ====================
+
+    setupChatPanel() {
+        const panel = document.getElementById('chat-panel');
+        const closeBtn = document.getElementById('chat-panel-close');
+        const input = document.getElementById('chat-input');
+        const sendBtn = document.getElementById('chat-send-btn');
+
+        if (!panel) return;
+
+        closeBtn?.addEventListener('click', () => {
+            panel.classList.remove('open');
+            document.getElementById('chat-indicator')?.classList.remove('active');
+            if (this.terminal) this.terminal.focus();
+        });
+
+        sendBtn?.addEventListener('click', () => this.sendChatMessage());
+
+        input?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                this.sendChatMessage();
+            }
+        });
+
+        // Auto-resize textarea
+        input?.addEventListener('input', () => {
+            input.style.height = 'auto';
+            input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+        });
+    }
+
+    openChatPanel(sessionMeta) {
+        const panel = document.getElementById('chat-panel');
+        const titleEl = document.getElementById('chat-panel-title');
+        const messagesEl = document.getElementById('chat-messages');
+        const indicator = document.getElementById('chat-indicator');
+
+        if (!panel) return;
+
+        if (titleEl) titleEl.textContent = sessionMeta.title || 'Chat';
+        if (messagesEl) messagesEl.innerHTML = '';
+
+        // Show system message
+        this.appendChatMessage('system', `Session: ${sessionMeta.sessionId.slice(0, 8)}...`);
+
+        panel.classList.add('open');
+        indicator?.classList.add('active');
+
+        // Load session in background
+        fetch(`/api/sessions/${sessionMeta.sessionId}/load`, { method: 'POST' }).catch(() => {});
+
+        // Focus input
+        setTimeout(() => {
+            document.getElementById('chat-input')?.focus();
+        }, 100);
+    }
+
+    sendChatMessage() {
+        const input = document.getElementById('chat-input');
+        if (!input || this.chatBusy) return;
+
+        const prompt = input.value.trim();
+        if (!prompt || !this.activeSessionId) return;
+
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            this.showToast('Not connected');
+            return;
+        }
+
+        // Show user message
+        this.appendChatMessage('user', prompt);
+        input.value = '';
+        input.style.height = 'auto';
+
+        // Set busy state
+        this.chatBusy = true;
+        this.setChatBusy(true);
+
+        // Send via WebSocket
+        this.socket.send(JSON.stringify({
+            type: 'chat',
+            sessionId: this.activeSessionId,
+            prompt,
+        }));
+    }
+
+    handleChatEvent(msg) {
+        if (msg.sessionId !== this.activeSessionId) return;
+
+        const event = msg.message;
+        if (!event) return;
+
+        switch (event.type) {
+            case 'assistant':
+                if (event.message && Array.isArray(event.message.content)) {
+                    for (const block of event.message.content) {
+                        if (block.type === 'text') {
+                            this.appendChatMessage('assistant', block.text);
+                        } else if (block.type === 'tool_use') {
+                            this.appendChatMessage('tool', `Tool: ${block.name}`);
+                        }
+                    }
+                }
+                break;
+
+            case 'user':
+                // Echo of user message or synthetic tool result — skip display
+                break;
+
+            case 'system':
+                if (event.subtype === 'init') {
+                    this.appendChatMessage('system', `Model: ${event.model || 'unknown'}`);
+                }
+                break;
+
+            case 'result':
+                if (event.subtype === 'success') {
+                    // Final result — already shown through assistant messages
+                } else if (event.subtype === 'error_max_turns') {
+                    this.appendChatMessage('system', 'Reached maximum turns limit.');
+                } else if (event.subtype === 'error_during_execution') {
+                    this.appendChatMessage('system', 'Error during execution.');
+                }
+                break;
+
+            // stream_event: partial streaming deltas — skip for now,
+            // full assistant messages arrive separately
+        }
+    }
+
+    onChatEnd(msg) {
+        if (msg.sessionId !== this.activeSessionId) return;
+        this.chatBusy = false;
+        this.setChatBusy(false);
+        if (msg.aborted) {
+            this.appendChatMessage('system', 'Aborted');
+        }
+    }
+
+    onChatError(msg) {
+        if (msg.sessionId !== this.activeSessionId) return;
+        this.chatBusy = false;
+        this.setChatBusy(false);
+        this.appendChatMessage('system', `Error: ${msg.error || 'Unknown error'}`);
+    }
+
+    setChatBusy(busy) {
+        const sendBtn = document.getElementById('chat-send-btn');
+        const typing = document.getElementById('chat-typing');
+        if (sendBtn) sendBtn.disabled = busy;
+        if (typing) typing.classList.toggle('visible', busy);
+    }
+
+    appendChatMessage(role, text) {
+        const messagesEl = document.getElementById('chat-messages');
+        if (!messagesEl) return;
+
+        const div = document.createElement('div');
+        div.className = `chat-message chat-message-${role}`;
+        div.textContent = text;
+        messagesEl.appendChild(div);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
     showToast(message, duration = 2000) {

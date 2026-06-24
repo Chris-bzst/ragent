@@ -11,6 +11,7 @@
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper 2>/dev/null; chmod +x node_modules/node-pty/prebuilds/darwin-x64/spawn-helper 2>/dev/null; true"
   },
   "dependencies": {
+    "@anthropic-ai/claude-code": "^1.0.128",
     "express": "^4.18.2",
     "express-basic-auth": "^1.2.1",
     "http-proxy-middleware": "^2.0.6",
