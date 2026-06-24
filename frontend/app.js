@@ -14,16 +14,45 @@ class WebClaudeCode {
         this._pasteSent = false;
         this._reconnectTimer = null;
 
+        // User-adjustable font-size offset (A-/A+), applied on top of the
+        // responsive base size and persisted across sessions.
+        this.fontSizeOffset = parseInt(localStorage.getItem('fontSizeOffset'), 10) || 0;
+        // Keep the result in a readable band: too small is unreadable, too large
+        // shrinks cols/rows enough to break tmux pane layout.
+        this.minFontSize = 10;
+        this.maxFontSize = 32;
+
         this.init();
     }
 
-    getResponsiveFontSize() {
+    getBaseFontSize() {
         const width = window.innerWidth;
-        if (width <= 320) return 10;
-        if (width <= 375) return 11;
-        if (width <= 480) return 12;
-        if (width <= 768) return 13;
-        return 14;
+        if (width <= 320) return 12;
+        if (width <= 375) return 13;
+        if (width <= 480) return 14;
+        if (width <= 768) return 15;
+        return 16;
+    }
+
+    getResponsiveFontSize() {
+        const size = this.getBaseFontSize() + this.fontSizeOffset;
+        return Math.max(this.minFontSize, Math.min(this.maxFontSize, size));
+    }
+
+    adjustFontSize(delta) {
+        const before = this.getResponsiveFontSize();
+        this.fontSizeOffset += delta;
+        const after = this.getResponsiveFontSize();
+        if (after === before) {
+            // Clamped at a limit — roll back the offset so it doesn't drift.
+            this.fontSizeOffset -= delta;
+            return;
+        }
+        localStorage.setItem('fontSizeOffset', String(this.fontSizeOffset));
+        if (this.terminal && this.fitAddon) {
+            this.terminal.options.fontSize = after;
+            this.fitAddon.fit();
+        }
     }
 
     init() {
@@ -34,6 +63,14 @@ class WebClaudeCode {
         this.setupSelectionOverlay();
         this.setupPasteOverlay();
         this.setupImagePaste();
+        this.setupFontControls();
+    }
+
+    setupFontControls() {
+        const decBtn = document.getElementById('font-dec-btn');
+        const incBtn = document.getElementById('font-inc-btn');
+        if (decBtn) decBtn.addEventListener('click', () => this.adjustFontSize(-1));
+        if (incBtn) incBtn.addEventListener('click', () => this.adjustFontSize(1));
     }
 
     setupTerminal() {
