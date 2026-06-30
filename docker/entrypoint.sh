@@ -52,7 +52,8 @@ mkdir -p /workspace
 echo "Verifying Claude Code installation..."
 if [ ! -f "/workspace/.local/bin/claude" ]; then
     echo "Claude CLI not found, installing..."
-    curl -fsSL https://claude.ai/install.sh | bash
+    mkdir -p /workspace/.local/bin
+    npm install -g @anthropic-ai/claude-code --prefix /workspace/.local
     if [ -f "/workspace/.local/bin/claude" ]; then
         echo "Claude Code CLI installed successfully"
     else
