@@ -240,7 +240,10 @@ Otherwise omit the block entirely.
 // stripped, so it never leaks into issue replies.
 function absorbNotes(agent, out) {
   const s = String(out || '');
-  const m = s.match(/```ragent-notes\s*\n([\s\S]*?)```/i);
+  // End-anchored: the notes block is instructed to be last, and the anchor
+  // makes the match run to the FINAL fence — notes containing inner ``` fences
+  // would otherwise be truncated at the first one and leak into the reply.
+  const m = s.match(/```ragent-notes\s*\n([\s\S]*?)\n?```\s*$/i);
   if (!m) return s;
   const stripped = (s.slice(0, m.index) + s.slice(m.index + m[0].length)).trim();
   if (!agent) return stripped;
@@ -267,13 +270,21 @@ function metaComment(origin, depth) {
   return `<!-- ragent-meta ${JSON.stringify({ origin, depth })} -->`;
 }
 
+// Read the LAST ragent-meta comment: the server always appends its own meta
+// at the end of a body it composes, and agent-authored request text (which
+// could embed a forged, lower-depth meta) is stripped in stripMeta — both are
+// needed, or an injected agent could reset the depth counter and loop forever.
 function parseMeta(body) {
-  const m = String(body || '').match(/<!--\s*ragent-meta\s*(\{[\s\S]*?\})\s*-->/);
-  if (!m) return { origin: null, depth: 0 };
+  const all = [...String(body || '').matchAll(/<!--\s*ragent-meta\s*(\{[\s\S]*?\})\s*-->/g)];
+  if (!all.length) return { origin: null, depth: 0 };
   try {
-    const j = JSON.parse(m[1]);
+    const j = JSON.parse(all[all.length - 1][1]);
     return { origin: typeof j.origin === 'string' ? j.origin : null, depth: Number(j.depth) || 0 };
   } catch (_) { return { origin: null, depth: 0 }; }
+}
+
+function stripMeta(text) {
+  return String(text || '').replace(/<!--\s*ragent-meta[\s\S]*?-->/g, '').trim();
 }
 
 // Extract ```ragent-request``` blocks from the agent's output; open a labeled
@@ -302,7 +313,7 @@ async function absorbRequests(agent, p, out) {
       continue;
     }
     const title = String(req.title || `Request from ${srcRef}`).slice(0, 200);
-    const body = `${String(req.body || '')}\n\n— requested by 🤖 Ragent[${agent.name}] from ${srcRef}\n\n${metaComment(srcRef, depth)}`;
+    const body = `${stripMeta(req.body)}\n\n— requested by 🤖 Ragent[${agent.name}] from ${srcRef}\n\n${metaComment(srcRef, depth)}`;
     const num = await openIssue(target, title, body, [ISSUE_LABEL]);
     results.push(num
       ? `📨 requested work from ${target}'s agent → ${target}#${num}`
@@ -391,7 +402,10 @@ function pumpDispatch() {
 // run: the agent's only write path is committing in its own worktree; the
 // server holds the credentials and publishes on its behalf.
 const AGENT_ENV_KEYS = ['HOME', 'TERM', 'LANG', 'LC_ALL', 'USER',
-  'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'];
+  'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
+  // network plumbing the CLI needs in proxied/corporate deployments
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
+  'NODE_EXTRA_CA_CERTS'];
 function agentEnv() {
   const env = { PATH: `/workspace/.local/bin:${process.env.PATH || ''}` };
   for (const k of AGENT_ENV_KEYS) if (process.env[k]) env[k] = process.env[k];
@@ -507,7 +521,7 @@ ${findingsText}
 
 Summary: ${p.summary || ''}
 
-Fix ONLY these reported issues in this repository. Do not make unrelated changes. When done, commit with a clear message (do NOT push — publishing is handled for you):
+Fix ONLY these reported issues in this repository. Do not make unrelated changes. The branch is already checked out locally; you have NO git network credentials (fetch/pull/push will fail) — work with the local checkout only. When done, commit with a clear message (do NOT push — publishing is handled for you):
 
   git add -A && git commit -m "Fix: <what you fixed>"`;
 
@@ -578,6 +592,7 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
   try {
     const reqs = await absorbRequests(agent, p, absorbNotes(agent, await runClaudeP(prompt, dir)));
     const out = reqs.text;
+    reqs.results.forEach((r) => console.error(`[implement] issue#${p.issue_number} ${r}`));
     console.error(`[implement] issue#${p.issue_number} claude finished: ${String(out).slice(-300)}`);
 
     const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(base)}..HEAD'`, { encoding: 'utf8' }).trim();
@@ -594,9 +609,15 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
     // probe/issue-N is owned by this flow — a re-run legitimately rewrites it.
     execSync(`git -C '${shellEscape(dir)}' push --force '${shellEscape(authUrl(p.repo))}' 'HEAD:refs/heads/${shellEscape(branch)}'`, { stdio: 'ignore' });
     const prNum = await openPullRequest(p, branch, base, agent);
-    await notifyOrigin(p, prNum
+    // Surface any cross-repo requests filed during the run on the issue, so
+    // the humans watching it can see a dependent task now exists elsewhere.
+    if (reqs.results.length) {
+      await postIssueComment(p, reqs.results.join('\n'), `while implementing #${p.issue_number}`, agent);
+    }
+    await notifyOrigin(p, (prNum
       ? `Handled ${p.repo}#${p.issue_number}: opened PR https://github.com/${p.repo}/pull/${prNum}`
-      : `Handled ${p.repo}#${p.issue_number}: pushed branch \`${branch}\` (PR may already exist)`);
+      : `Handled ${p.repo}#${p.issue_number}: pushed branch \`${branch}\` (PR may already exist)`)
+      + (reqs.results.length ? '\n' + reqs.results.join('\n') : ''));
   } catch (e) {
     console.error(`[implement] issue#${p.issue_number} error: ${scrubToken(e.message)}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
     // Don't leave the requesting agent waiting on a silent failure.
@@ -732,7 +753,7 @@ Otherwise output ONLY the reply itself — no preamble, no meta-commentary, no b
       const b = blk[1].match(/BODY:\s*([\s\S]*)/i);
       const title = (t && t[1].trim()) || `Task from #${p.issue_number}`;
       const spinDepth = (Number(p.depth) || 0) + 1;
-      const issueBody = ((b && b[1].trim()) || '') +
+      const issueBody = stripMeta((b && b[1].trim()) || '') +
         `\n\n— spun off from #${p.issue_number} by 🤖 Ragent\n\n${metaComment(`${p.repo}#${p.issue_number}`, spinDepth)}`;
       reply = reply.replace(blk[0], '').trim();
       const num = spinDepth > MAX_REQUEST_DEPTH ? null
