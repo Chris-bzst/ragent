@@ -56,7 +56,9 @@ Each registered agent gets:
 
 Jobs for the same repo run serially; different repos run in parallel up to `DISPATCH_CONCURRENCY`.
 
-Related env: `DISPATCH_GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, `DISPATCH_ISSUE_LABEL` (default `agent`), `RAGENT_MAX_DEPTH`, `DISPATCH_CONCURRENCY`.
+**Configuration**: the GitHub token and webhook secret come from env vars (`DISPATCH_GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`) or, as a fallback, from `/workspace/.ragent/config.json` (`{ "github_token", "webhook_secret" }`) — the file is read lazily, so it can be edited from the instance's own terminal without a restart, and the webhook secret is auto-generated there on first boot. Everything else (labels, webhooks, the registry) can be set up conversationally: the web-terminal Claude session acts as the instance's orchestrator (see `ORCHESTRATOR.md`, seeded into `/workspace`) — tell it to "onboard owner/repo" and it creates the label, the webhook, and the registry entry.
+
+Tuning env: `DISPATCH_ISSUE_LABEL` (default `agent`), `RAGENT_MAX_DEPTH` (default 3), `DISPATCH_CONCURRENCY` (default 1).
 
 ## Features
 

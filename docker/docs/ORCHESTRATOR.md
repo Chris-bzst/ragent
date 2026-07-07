@@ -55,10 +55,43 @@ agent replies in-thread, grounded in its repo, without opening a PR.
 - When agents delegate to each other, outcomes are reported back on the origin
   issue automatically — you only need to watch the issues you opened.
 
-## Registering a new agent
+## Instance configuration
 
-Edit `/workspace/agents/agents.json` and add the repo with a name (and
-optionally a persona). Registration doubles as the whitelist for cross-repo
-requests, so only add repos the user actually controls. The repo must also
-have this instance's webhook configured (events: `issues`, `issue_comment`)
-and the trigger label created.
+Secrets live in env vars (which always win) or in
+`/workspace/.ragent/config.json` (chmod 600, read lazily — edits take effect
+without a restart):
+
+    { "github_token": "...", "webhook_secret": "..." }
+
+The `webhook_secret` is auto-generated on first boot. If `github_token` is
+missing, ask the user to add it **from a plain shell prompt, not through this
+conversation** — pasted secrets would otherwise end up in the session context.
+
+To use `gh` yourself, export the token from the config file first:
+
+    export GH_TOKEN=$(node -e 'console.log(require("/workspace/.ragent/config.json").github_token||"")')
+
+## Onboarding a new repo
+
+When the user asks to bring a repo under management, do all of this for them:
+
+1. Verify a GitHub token is configured (see above); it needs Contents,
+   Issues, and Pull requests read/write on the target repo.
+2. Ask for the instance's public URL if you don't know it.
+3. Create the trigger label (an already-exists error is fine):
+
+       gh api repos/OWNER/REPO/labels -f name=agent -f color=5319e7
+
+4. Create the webhook, with the secret from the config file:
+
+       gh api repos/OWNER/REPO/hooks -f name=web -F active=true \
+         -f "events[]=issues" -f "events[]=issue_comment" \
+         -f "config[url]=https://<instance>/webhooks/github" \
+         -f "config[content_type]=json" \
+         -f "config[secret]=<webhook_secret from config.json>"
+
+5. Register the agent in `/workspace/agents/agents.json` (name + optional
+   persona). Registration doubles as the whitelist for cross-repo requests,
+   so only add repos the user actually controls.
+6. Smoke test: open a trivial labeled issue in the repo and confirm a PR
+   (branch `probe/issue-<N>`) or a reply arrives within a few minutes.

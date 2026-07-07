@@ -38,6 +38,38 @@ const PORT = process.env.PORT || 3001;
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR ||
   (fs.existsSync('/workspace') ? '/workspace' : process.cwd());
 
+// ── Instance configuration: env first, file fallback ────────────────────────
+// Secrets can live in the persistent volume (like Claude's own credentials in
+// ~/.claude) so an instance can be configured from its own terminal without
+// touching platform env or redeploying. Env vars always win. The file is read
+// lazily on every use, so edits take effect without a restart.
+const RAGENT_CONFIG_PATH = path.join(WORKSPACE_DIR, '.ragent', 'config.json');
+function fileConfig() {
+  try { return JSON.parse(fs.readFileSync(RAGENT_CONFIG_PATH, 'utf8')) || {}; }
+  catch (_) { return {}; }
+}
+function ghToken() {
+  return process.env.DISPATCH_GITHUB_TOKEN || String(fileConfig().github_token || '');
+}
+function webhookSecret() {
+  return process.env.GITHUB_WEBHOOK_SECRET || String(fileConfig().webhook_secret || '');
+}
+// First boot with no secret anywhere → generate one into the config file, so
+// onboarding never requires inventing a secret by hand (read it from the file
+// when configuring the GitHub webhook).
+(function ensureWebhookSecret() {
+  if (webhookSecret()) return;
+  try {
+    fs.mkdirSync(path.dirname(RAGENT_CONFIG_PATH), { recursive: true });
+    const cfg = fileConfig();
+    cfg.webhook_secret = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(RAGENT_CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+    console.log(`Webhook secret generated → ${RAGENT_CONFIG_PATH}`);
+  } catch (e) {
+    console.error('Could not generate webhook secret:', e.message);
+  }
+})();
+
 // Health check endpoint (before auth middleware)
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -49,13 +81,12 @@ app.get('/health', (req, res) => {
 // reported findings, and pushes — closing the loop in Ragent's environment.
 // Mounted before basic-auth: authenticated by HMAC signature, not credentials.
 const DISPATCH_SECRET = process.env.PROBE_DISPATCH_SECRET;
-const DISPATCH_GH_TOKEN = process.env.DISPATCH_GITHUB_TOKEN;
 const DISPATCH_AUTHOR_NAME = process.env.DISPATCH_GIT_AUTHOR_NAME || 'ragent';
 const DISPATCH_AUTHOR_EMAIL = process.env.DISPATCH_GIT_AUTHOR_EMAIL || 'ragent@users.noreply.github.com';
 
 app.post('/api/dispatch', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
-  if (!DISPATCH_SECRET || !DISPATCH_GH_TOKEN) {
-    return res.status(503).json({ error: 'dispatch not configured (set PROBE_DISPATCH_SECRET + DISPATCH_GITHUB_TOKEN)' });
+  if (!DISPATCH_SECRET || !ghToken()) {
+    return res.status(503).json({ error: 'dispatch not configured (set PROBE_DISPATCH_SECRET + a GitHub token via DISPATCH_GITHUB_TOKEN or /workspace/.ragent/config.json)' });
   }
   const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
   const sig = req.headers['x-probe-signature-256'];
@@ -90,16 +121,16 @@ app.post('/api/dispatch', express.raw({ type: '*/*', limit: '2mb' }), async (req
 // them directly here. `issues` (labeled with the trigger label) → implement;
 // `issue_comment` starting with "/ragent" on a real issue → converse. PR-comment
 // `/probe` adjudication and deployment_status stay on Probe's own webhook.
-const WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 const ISSUE_LABEL = process.env.DISPATCH_ISSUE_LABEL || 'agent';
 
 app.post('/webhooks/github', express.raw({ type: '*/*', limit: '2mb' }), (req, res) => {
-  if (!WEBHOOK_SECRET || !DISPATCH_GH_TOKEN) {
-    return res.status(503).json({ error: 'webhook not configured (set GITHUB_WEBHOOK_SECRET + DISPATCH_GITHUB_TOKEN)' });
+  const secret = webhookSecret();
+  if (!secret || !ghToken()) {
+    return res.status(503).json({ error: 'webhook not configured (need a webhook secret + a GitHub token, via env or /workspace/.ragent/config.json)' });
   }
   const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
   const sig = req.headers['x-hub-signature-256'];
-  const expected = 'sha256=' + crypto.createHmac('sha256', WEBHOOK_SECRET).update(raw).digest('hex');
+  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');
   const ok = typeof sig === 'string' && sig.length === expected.length &&
     crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
   if (!ok) return res.status(401).json({ error: 'invalid signature' });
@@ -417,10 +448,12 @@ function agentEnv() {
 // config, so a token there would be one `git remote get-url` away from the
 // agent). scrubToken keeps it out of logged error messages too.
 function authUrl(repo) {
-  return `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${repo}.git`;
+  return `https://x-access-token:${ghToken()}@github.com/${repo}.git`;
 }
 function scrubToken(s) {
-  return String(s || '').split(DISPATCH_GH_TOKEN).join('***');
+  const t = ghToken();
+  if (!t) return String(s || '');
+  return String(s || '').split(t).join('***');
 }
 
 // Run `claude -p` ASYNCHRONOUSLY (spawn, not execSync) so it never blocks the
@@ -642,7 +675,7 @@ function githubPost(apiPath, payload, attempt = 1) {
     const req = https.request({
       hostname: 'api.github.com', path: apiPath, method: 'POST',
       headers: {
-        Authorization: `Bearer ${DISPATCH_GH_TOKEN}`,
+        Authorization: `Bearer ${ghToken()}`,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
         'User-Agent': 'ragent-dispatch',
@@ -801,7 +834,7 @@ function getPullBranch(repo, prNumber) {
     const req = https.request({
       hostname: 'api.github.com', path: `/repos/${repo}/pulls/${prNumber}`, method: 'GET',
       headers: {
-        Authorization: `Bearer ${DISPATCH_GH_TOKEN}`,
+        Authorization: `Bearer ${ghToken()}`,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
         'User-Agent': 'ragent-dispatch',
@@ -823,7 +856,7 @@ function getIssueThread(p) {
     const req = https.request({
       hostname: 'api.github.com', path: `/repos/${p.repo}/issues/${p.issue_number}/comments?per_page=100`, method: 'GET',
       headers: {
-        Authorization: `Bearer ${DISPATCH_GH_TOKEN}`,
+        Authorization: `Bearer ${ghToken()}`,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
         'User-Agent': 'ragent-dispatch',
