@@ -428,10 +428,14 @@ function pumpDispatch() {
 }
 
 // The agent process gets a MINIMAL env: shell basics + Claude auth only —
-// never the server's full env. DISPATCH_GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET,
-// PROBE_DISPATCH_SECRET and AUTH_PASSWORD must not be readable from inside a
-// run: the agent's only write path is committing in its own worktree; the
-// server holds the credentials and publishes on its behalf.
+// never the server's full env (GITHUB_WEBHOOK_SECRET, PROBE_DISPATCH_SECRET,
+// AUTH_PASSWORD stay server-side). The repo credential reaches the agent via
+// its worktree's authenticated remote instead: each agent owns the full git
+// workflow for ITS OWN repository, pushes included. Trust model: this
+// instance manages the operator's own private repos with trusted issue
+// authors — cross-repo discipline is structural (a job's worktree contains
+// only its own repo) plus a prompt contract, not a runtime gate. If a repo
+// ever goes public, switch to per-repo tokens in the registry instead.
 const AGENT_ENV_KEYS = ['HOME', 'TERM', 'LANG', 'LC_ALL', 'USER',
   'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
   // network plumbing the CLI needs in proxied/corporate deployments
@@ -443,10 +447,8 @@ function agentEnv() {
   return env;
 }
 
-// Authenticated URL for server-side git network commands. It travels only on
-// those command lines — never into .git/config (worktrees share the cache's
-// config, so a token there would be one `git remote get-url` away from the
-// agent). scrubToken keeps it out of logged error messages too.
+// Authenticated remote URL for a repo. scrubToken keeps the token out of
+// logged error messages.
 function authUrl(repo) {
   return `https://x-access-token:${ghToken()}@github.com/${repo}.git`;
 }
@@ -485,9 +487,10 @@ function runClaudeP(prompt, cwd) {
 }
 
 // Per-repo cache clone, created once; subsequent dispatches only fetch
-// (incremental, reuses the object store) instead of re-downloading. The
-// configured origin is the PUBLIC url — worktrees share this config, so a
-// token here would be one `git remote get-url` away from the agent.
+// (incremental, reuses the object store) instead of re-downloading. Origin is
+// the authenticated URL (re-set every time so token changes take effect);
+// worktrees share this config, which is intentional: the agent owns pushes to
+// its own repo.
 function prepareCache(repo) {
   const slug = repo.replace('/', '-');
   const cacheDir = path.join(WORKSPACE_DIR, 'dispatch', '.cache', slug);
@@ -496,35 +499,14 @@ function prepareCache(repo) {
     execSync(`mkdir -p '${shellEscape(path.dirname(cacheDir))}'`, { stdio: 'ignore' });
     execSync(`git clone --filter=blob:none --no-checkout '${shellEscape(authUrl(repo))}' '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
   }
-  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin 'https://github.com/${repo}.git'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin '${shellEscape(authUrl(repo))}'`, { stdio: 'ignore' });
   return cacheDir;
 }
 
-// Fetch a branch into the cache's remote-tracking ref, authenticating on the
-// command line only. Forced refspec: the remote branch may have been rewritten.
-function fetchBranch(cacheDir, repo, branch) {
-  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags '${shellEscape(authUrl(repo))}' '+refs/heads/${shellEscape(branch)}:refs/remotes/origin/${shellEscape(branch)}'`, { stdio: 'ignore' });
-}
-
-// Server-side publication: the agent only commits, the server pushes. If the
-// remote branch moved during the run (non-fast-forward), retry once after a
-// rebase; a conflicted rebase aborts and fails loudly rather than forcing.
-function pushBranch(dir, repo, branch, tag) {
-  const url = shellEscape(authUrl(repo));
-  const push = () => execSync(`git -C '${shellEscape(dir)}' push '${url}' 'HEAD:refs/heads/${shellEscape(branch)}'`, { stdio: 'ignore' });
-  try { push(); return true; } catch (_) {
-    try {
-      execSync(`git -C '${shellEscape(dir)}' fetch --no-tags '${url}' '${shellEscape(branch)}'`, { stdio: 'ignore' });
-      execSync(`git -C '${shellEscape(dir)}' rebase FETCH_HEAD`, { stdio: 'ignore' });
-      push();
-      console.error(`[dispatch] ${tag} pushed after rebase (branch moved during the run)`);
-      return true;
-    } catch (e) {
-      try { execSync(`git -C '${shellEscape(dir)}' rebase --abort`, { stdio: 'ignore' }); } catch (_) {}
-      console.error(`[dispatch] ${tag} push failed after rebase retry: ${scrubToken(e.message)}`);
-      return false;
-    }
-  }
+// Fetch a branch into the cache's remote-tracking ref. Forced refspec: the
+// remote branch may have been rewritten.
+function fetchBranch(cacheDir, branch) {
+  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags origin '+refs/heads/${shellEscape(branch)}:refs/remotes/origin/${shellEscape(branch)}'`, { stdio: 'ignore' });
 }
 
 async function runDispatch(p) {
@@ -533,7 +515,7 @@ async function runDispatch(p) {
   console.error(`[dispatch] ${p.repo}#${p.pr_number} → ${dir} (branch ${p.branch}, active=${dispatchActive})`);
 
   const cacheDir = prepareCache(p.repo);
-  fetchBranch(cacheDir, p.repo, p.branch);
+  fetchBranch(cacheDir, p.branch);
 
   // Per-PR worktree off the shared cache: isolated working tree, near-zero disk
   // (shares the cache object store), safe for concurrent PRs of the same repo.
@@ -554,9 +536,12 @@ ${findingsText}
 
 Summary: ${p.summary || ''}
 
-Fix ONLY these reported issues in this repository. Do not make unrelated changes. The branch is already checked out locally; you have NO git network credentials (fetch/pull/push will fail) — work with the local checkout only. When done, commit with a clear message (do NOT push — publishing is handled for you):
+Fix ONLY these reported issues in this repository. Do not make unrelated changes. THIS repository is your only scope — never use your git credentials against any other repository; if the fix requires changes elsewhere, say so instead. When done, commit with a clear message and push to the current branch (\`${p.branch}\`):
 
-  git add -A && git commit -m "Fix: <what you fixed>"`;
+  git add -A && git commit -m "Fix: <what you fixed>"
+  git push origin ${p.branch}
+
+The remote is already authenticated. If the push is rejected because the branch moved, run \`git pull --rebase origin ${p.branch}\` and push again.`;
 
   // Drive the Claude Code CLI in headless print mode (already installed in the
   // container; the SDK npm package isn't in the production deps). Prompt via
@@ -565,12 +550,6 @@ Fix ONLY these reported issues in this repository. Do not make unrelated changes
     const reqs = await absorbRequests(agent, p, absorbNotes(agent, await runClaudeP(prompt, dir)));
     reqs.results.forEach((r) => console.error(`[dispatch] ${p.repo}#${p.pr_number} ${r}`));
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude finished: ${reqs.text.slice(-300)}`);
-    const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(p.branch)}..HEAD'`, { encoding: 'utf8' }).trim();
-    if (ahead === '0' || ahead === '') {
-      console.error(`[dispatch] ${p.repo}#${p.pr_number}: agent made no commits — nothing to push`);
-    } else {
-      pushBranch(dir, p.repo, p.branch, `${p.repo}#${p.pr_number}`);
-    }
   } catch (e) {
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude error: ${scrubToken(e.message)}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
     throw e;
@@ -595,7 +574,7 @@ async function runImplement(p) {
   console.error(`[implement] ${p.repo} issue#${p.issue_number} → ${dir} (new branch ${branch} off ${base})`);
 
   const cacheDir = prepareCache(p.repo);
-  fetchBranch(cacheDir, p.repo, base);
+  fetchBranch(cacheDir, base);
 
   execSync(`git -C '${shellEscape(cacheDir)}' worktree prune`, { stdio: 'ignore' });
   execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}' 2>/dev/null || true`, { stdio: 'ignore', shell: '/bin/bash' });
@@ -620,7 +599,9 @@ CASE B — the issue is a QUESTION, a status/progress request, a discussion, or 
   Do NOT commit anything. Instead, write your COMPLETE answer as your final message — it will be posted VERBATIM as a comment on the issue. Read the actual code/docs to ground your answer and reference specifics. Be concise and useful.
   Your final message must contain ONLY the answer itself, written directly to the issue reader. NO preamble or meta-commentary — do not say things like "this is a question", "CASE B", "here is my answer", or describe what you are about to do. Start straight with the substantive response.
 
-Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final message is posted as an issue comment.`;
+Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final message is posted as an issue comment.
+
+THIS repository is your only scope — never use your git credentials against any other repository. If the task requires changes elsewhere, say so (or file a ragent-request if you have peers) instead of doing it yourself.`;
 
   try {
     const reqs = await absorbRequests(agent, p, absorbNotes(agent, await runClaudeP(prompt, dir)));
@@ -640,7 +621,7 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
       return;
     }
     // probe/issue-N is owned by this flow — a re-run legitimately rewrites it.
-    execSync(`git -C '${shellEscape(dir)}' push --force '${shellEscape(authUrl(p.repo))}' 'HEAD:refs/heads/${shellEscape(branch)}'`, { stdio: 'ignore' });
+    execSync(`git -C '${shellEscape(dir)}' push --force origin 'HEAD:refs/heads/${shellEscape(branch)}'`, { stdio: 'ignore' });
     const prNum = await openPullRequest(p, branch, base, agent);
     // Surface any cross-repo requests filed during the run on the issue, so
     // the humans watching it can see a dependent task now exists elsewhere.
@@ -739,7 +720,7 @@ async function runConverse(p) {
   console.error(`[converse] ${p.repo} issue#${p.issue_number} → reading repo + thread`);
 
   const cacheDir = prepareCache(p.repo);
-  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags '${shellEscape(authUrl(p.repo))}' HEAD`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags origin HEAD`, { stdio: 'ignore' });
   execSync(`git -C '${shellEscape(cacheDir)}' worktree prune`, { stdio: 'ignore' });
   execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}' 2>/dev/null || true`, { stdio: 'ignore', shell: '/bin/bash' });
   execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });

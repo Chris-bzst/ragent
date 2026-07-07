@@ -51,7 +51,7 @@ Each registered agent gets:
 
 - **Identity** — its name and persona are injected into every run; replies are signed `🤖 Ragent[name]`.
 - **Memory** — a persistent notes file (`/workspace/agents/<slug>/notes.md`) injected into every prompt. The agent updates it by ending its output with a ` ```ragent-notes ` block; only the server writes the file.
-- **Scoped writes** — agents only commit in their own worktree; the server holds the GitHub token and pushes on their behalf. Credentials never enter the agent's env or git config.
+- **Own-repo autonomy** — each agent owns the full git workflow for its repository: it commits, pushes, and resolves conflicts itself (its worktree's remote is authenticated). Cross-repo discipline is structural — a job's worktree contains only its own repo — plus an explicit prompt contract; server secrets (webhook secret, basic-auth) never enter the agent's env. This model assumes the instance manages **your own private repos with trusted issue authors**; if a repo goes public, move that repo to its own fine-grained per-repo token.
 - **Cross-repo requests** — an agent never touches a peer repo. It emits a ` ```ragent-request {"repo", "title", "body"} ` block; the server opens a labeled issue in the target repo, waking that repo's agent, and reports the outcome back on the origin issue. Delegation chains carry `ragent-meta` origin/depth metadata and stop at `RAGENT_MAX_DEPTH` (default 3).
 
 Jobs for the same repo run serially; different repos run in parallel up to `DISPATCH_CONCURRENCY`.
