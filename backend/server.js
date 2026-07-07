@@ -51,7 +51,7 @@ app.get('/health', (req, res) => {
 const DISPATCH_SECRET = process.env.PROBE_DISPATCH_SECRET;
 const DISPATCH_GH_TOKEN = process.env.DISPATCH_GITHUB_TOKEN;
 const DISPATCH_AUTHOR_NAME = process.env.DISPATCH_GIT_AUTHOR_NAME || 'ragent';
-const DISPATCH_AUTHOR_EMAIL = process.env.DISPATCH_GIT_AUTHOR_EMAIL || '';
+const DISPATCH_AUTHOR_EMAIL = process.env.DISPATCH_GIT_AUTHOR_EMAIL || 'ragent@users.noreply.github.com';
 
 app.post('/api/dispatch', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
   if (!DISPATCH_SECRET || !DISPATCH_GH_TOKEN) {
@@ -213,6 +213,30 @@ function pumpDispatch() {
   }
 }
 
+// The agent process gets a MINIMAL env: shell basics + Claude auth only —
+// never the server's full env. DISPATCH_GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET,
+// PROBE_DISPATCH_SECRET and AUTH_PASSWORD must not be readable from inside a
+// run: the agent's only write path is committing in its own worktree; the
+// server holds the credentials and publishes on its behalf.
+const AGENT_ENV_KEYS = ['HOME', 'TERM', 'LANG', 'LC_ALL', 'USER',
+  'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'];
+function agentEnv() {
+  const env = { PATH: `/workspace/.local/bin:${process.env.PATH || ''}` };
+  for (const k of AGENT_ENV_KEYS) if (process.env[k]) env[k] = process.env[k];
+  return env;
+}
+
+// Authenticated URL for server-side git network commands. It travels only on
+// those command lines — never into .git/config (worktrees share the cache's
+// config, so a token there would be one `git remote get-url` away from the
+// agent). scrubToken keeps it out of logged error messages too.
+function authUrl(repo) {
+  return `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${repo}.git`;
+}
+function scrubToken(s) {
+  return String(s || '').split(DISPATCH_GH_TOKEN).join('***');
+}
+
 // Run `claude -p` ASYNCHRONOUSLY (spawn, not execSync) so it never blocks the
 // Node event loop. This process also serves the web terminal (WebSocket + pty);
 // a synchronous multi-minute dispatch would freeze it for the whole run. Writes
@@ -223,7 +247,7 @@ function runClaudeP(prompt, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn(claudeBin, ['-p', '--dangerously-skip-permissions'], {
       cwd,
-      env: { ...process.env, PATH: `/workspace/.local/bin:${process.env.PATH || ''}` },
+      env: agentEnv(),
     });
     let out = '', err = '';
     const MAX = 64 * 1024 * 1024;
@@ -241,22 +265,56 @@ function runClaudeP(prompt, cwd) {
   });
 }
 
-async function runDispatch(p) {
-  const slug = p.repo.replace('/', '-');
+// Per-repo cache clone, created once; subsequent dispatches only fetch
+// (incremental, reuses the object store) instead of re-downloading. The
+// configured origin is the PUBLIC url — worktrees share this config, so a
+// token here would be one `git remote get-url` away from the agent.
+function prepareCache(repo) {
+  const slug = repo.replace('/', '-');
   const cacheDir = path.join(WORKSPACE_DIR, 'dispatch', '.cache', slug);
-  const dir = path.join(WORKSPACE_DIR, 'dispatch', `${slug}-pr${p.pr_number}`);
-  const cloneUrl = `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${p.repo}.git`;
-  console.error(`[dispatch] ${p.repo}#${p.pr_number} → ${dir} (branch ${p.branch}, active=${dispatchActive})`);
-
-  // Per-repo cache clone, created once; subsequent dispatches only fetch the
-  // branch (incremental, reuses the object store) instead of re-downloading.
   if (!fs.existsSync(path.join(cacheDir, '.git'))) {
     execSync(`rm -rf '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
     execSync(`mkdir -p '${shellEscape(path.dirname(cacheDir))}'`, { stdio: 'ignore' });
-    execSync(`git clone --filter=blob:none --no-checkout '${cloneUrl}' '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
+    execSync(`git clone --filter=blob:none --no-checkout '${shellEscape(authUrl(repo))}' '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
   }
-  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin '${cloneUrl}'`, { stdio: 'ignore' });
-  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags origin '${shellEscape(p.branch)}'`, { stdio: 'ignore' });
+  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin 'https://github.com/${repo}.git'`, { stdio: 'ignore' });
+  return cacheDir;
+}
+
+// Fetch a branch into the cache's remote-tracking ref, authenticating on the
+// command line only. Forced refspec: the remote branch may have been rewritten.
+function fetchBranch(cacheDir, repo, branch) {
+  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags '${shellEscape(authUrl(repo))}' '+refs/heads/${shellEscape(branch)}:refs/remotes/origin/${shellEscape(branch)}'`, { stdio: 'ignore' });
+}
+
+// Server-side publication: the agent only commits, the server pushes. If the
+// remote branch moved during the run (non-fast-forward), retry once after a
+// rebase; a conflicted rebase aborts and fails loudly rather than forcing.
+function pushBranch(dir, repo, branch, tag) {
+  const url = shellEscape(authUrl(repo));
+  const push = () => execSync(`git -C '${shellEscape(dir)}' push '${url}' 'HEAD:refs/heads/${shellEscape(branch)}'`, { stdio: 'ignore' });
+  try { push(); return true; } catch (_) {
+    try {
+      execSync(`git -C '${shellEscape(dir)}' fetch --no-tags '${url}' '${shellEscape(branch)}'`, { stdio: 'ignore' });
+      execSync(`git -C '${shellEscape(dir)}' rebase FETCH_HEAD`, { stdio: 'ignore' });
+      push();
+      console.error(`[dispatch] ${tag} pushed after rebase (branch moved during the run)`);
+      return true;
+    } catch (e) {
+      try { execSync(`git -C '${shellEscape(dir)}' rebase --abort`, { stdio: 'ignore' }); } catch (_) {}
+      console.error(`[dispatch] ${tag} push failed after rebase retry: ${scrubToken(e.message)}`);
+      return false;
+    }
+  }
+}
+
+async function runDispatch(p) {
+  const slug = p.repo.replace('/', '-');
+  const dir = path.join(WORKSPACE_DIR, 'dispatch', `${slug}-pr${p.pr_number}`);
+  console.error(`[dispatch] ${p.repo}#${p.pr_number} → ${dir} (branch ${p.branch}, active=${dispatchActive})`);
+
+  const cacheDir = prepareCache(p.repo);
+  fetchBranch(cacheDir, p.repo, p.branch);
 
   // Per-PR worktree off the shared cache: isolated working tree, near-zero disk
   // (shares the cache object store), safe for concurrent PRs of the same repo.
@@ -276,20 +334,22 @@ ${findingsText}
 
 Summary: ${p.summary || ''}
 
-Fix ONLY these reported issues in this repository. Do not make unrelated changes. When done, commit with a clear message and push to the current branch (\`${p.branch}\`):
+Fix ONLY these reported issues in this repository. Do not make unrelated changes. When done, commit with a clear message (do NOT push — publishing is handled for you):
 
-  git commit -am "Fix: <what you fixed>"
-  git push origin ${p.branch}
-
-The git remote is already authenticated.`;
+  git add -A && git commit -m "Fix: <what you fixed>"`;
 
   // Drive the Claude Code CLI in headless print mode (already installed in the
   // container; the SDK npm package isn't in the production deps). Prompt via
   // stdin; the CLI uses the container's existing Claude auth.
-  const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
   try {
     const out = await runClaudeP(prompt, dir);
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude finished: ${String(out).slice(-300)}`);
+    const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(p.branch)}..HEAD'`, { encoding: 'utf8' }).trim();
+    if (ahead === '0' || ahead === '') {
+      console.error(`[dispatch] ${p.repo}#${p.pr_number}: agent made no commits — nothing to push`);
+    } else {
+      pushBranch(dir, p.repo, p.branch, `${p.repo}#${p.pr_number}`);
+    }
   } catch (e) {
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
     throw e;
@@ -308,20 +368,13 @@ The git remote is already authenticated.`;
 // existing deployment→acceptance loop then takes over on that PR.
 async function runImplement(p) {
   const slug = p.repo.replace('/', '-');
-  const cacheDir = path.join(WORKSPACE_DIR, 'dispatch', '.cache', slug);
   const base = p.base_branch || 'main';
   const branch = `probe/issue-${p.issue_number}`;
   const dir = path.join(WORKSPACE_DIR, 'dispatch', `${slug}-issue${p.issue_number}`);
-  const cloneUrl = `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${p.repo}.git`;
   console.error(`[implement] ${p.repo} issue#${p.issue_number} → ${dir} (new branch ${branch} off ${base})`);
 
-  if (!fs.existsSync(path.join(cacheDir, '.git'))) {
-    execSync(`rm -rf '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
-    execSync(`mkdir -p '${shellEscape(path.dirname(cacheDir))}'`, { stdio: 'ignore' });
-    execSync(`git clone --filter=blob:none --no-checkout '${cloneUrl}' '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
-  }
-  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin '${cloneUrl}'`, { stdio: 'ignore' });
-  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags origin '${shellEscape(base)}'`, { stdio: 'ignore' });
+  const cacheDir = prepareCache(p.repo);
+  fetchBranch(cacheDir, p.repo, base);
 
   execSync(`git -C '${shellEscape(cacheDir)}' worktree prune`, { stdio: 'ignore' });
   execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}' 2>/dev/null || true`, { stdio: 'ignore', shell: '/bin/bash' });
@@ -347,7 +400,6 @@ CASE B — the issue is a QUESTION, a status/progress request, a discussion, or 
 
 Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final message is posted as an issue comment.`;
 
-  const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
   try {
     const out = await runClaudeP(prompt, dir);
     console.error(`[implement] issue#${p.issue_number} claude finished: ${String(out).slice(-300)}`);
@@ -361,7 +413,8 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
       await postIssueComment(p, reply, `replied to #${p.issue_number}; no code change needed`);
       return;
     }
-    execSync(`git -C '${shellEscape(dir)}' push --force origin '${shellEscape(branch)}'`, { stdio: 'ignore' });
+    // probe/issue-N is owned by this flow — a re-run legitimately rewrites it.
+    execSync(`git -C '${shellEscape(dir)}' push --force '${shellEscape(authUrl(p.repo))}' 'HEAD:refs/heads/${shellEscape(branch)}'`, { stdio: 'ignore' });
     await openPullRequest(p, branch, base);
   } catch (e) {
     console.error(`[implement] issue#${p.issue_number} error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
@@ -439,18 +492,11 @@ async function openPullRequest(p, head, base) {
 // "/ragent" request as an issue comment. No commit, no PR — read-only worktree.
 async function runConverse(p) {
   const slug = p.repo.replace('/', '-');
-  const cacheDir = path.join(WORKSPACE_DIR, 'dispatch', '.cache', slug);
   const dir = path.join(WORKSPACE_DIR, 'dispatch', `${slug}-converse-${p.issue_number}`);
-  const cloneUrl = `https://x-access-token:${DISPATCH_GH_TOKEN}@github.com/${p.repo}.git`;
   console.error(`[converse] ${p.repo} issue#${p.issue_number} → reading repo + thread`);
 
-  if (!fs.existsSync(path.join(cacheDir, '.git'))) {
-    execSync(`rm -rf '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
-    execSync(`mkdir -p '${shellEscape(path.dirname(cacheDir))}'`, { stdio: 'ignore' });
-    execSync(`git clone --filter=blob:none --no-checkout '${cloneUrl}' '${shellEscape(cacheDir)}'`, { stdio: 'ignore' });
-  }
-  execSync(`git -C '${shellEscape(cacheDir)}' remote set-url origin '${cloneUrl}'`, { stdio: 'ignore' });
-  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags origin HEAD`, { stdio: 'ignore' });
+  const cacheDir = prepareCache(p.repo);
+  execSync(`git -C '${shellEscape(cacheDir)}' fetch --no-tags '${shellEscape(authUrl(p.repo))}' HEAD`, { stdio: 'ignore' });
   execSync(`git -C '${shellEscape(cacheDir)}' worktree prune`, { stdio: 'ignore' });
   execSync(`git -C '${shellEscape(cacheDir)}' worktree remove --force '${shellEscape(dir)}' 2>/dev/null || true`, { stdio: 'ignore', shell: '/bin/bash' });
   execSync(`rm -rf '${shellEscape(dir)}'`, { stdio: 'ignore' });
@@ -482,7 +528,6 @@ BODY: <a clear, self-contained spec a coding agent can implement directly — wh
 
 Otherwise output ONLY the reply itself — no preamble, no meta-commentary, no block.`;
 
-    const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
     const out = await runClaudeP(prompt, dir);
     let reply = String(out || '').trim() || '(no response generated)';
 
