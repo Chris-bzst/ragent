@@ -165,6 +165,75 @@ app.post('/webhooks/github', express.raw({ type: '*/*', limit: '2mb' }), (req, r
   }
 });
 
+// ── Per-repo agents: registry + persistent notes (memory) ──────────────────
+// /workspace/agents/agents.json maps "owner/repo" → { name, persona }. A
+// registered repo gets a named agent identity and a notes file at
+// /workspace/agents/<slug>/notes.md — its only memory across runs. Notes are
+// injected into every prompt and updated ONLY by the server, from a
+// ```ragent-notes``` block in the agent's output: agents never hold a write
+// path to memory files (theirs or anyone else's), so one agent can't poison
+// another's memory. Unregistered repos keep the anonymous default behavior.
+const AGENTS_DIR = path.join(WORKSPACE_DIR, 'agents');
+const NOTES_INJECT_MAX = 8 * 1024;   // prompt budget
+const NOTES_STORE_MAX = 16 * 1024;   // on-disk cap
+
+function agentRegistry() {
+  try { return JSON.parse(fs.readFileSync(path.join(AGENTS_DIR, 'agents.json'), 'utf8')) || {}; }
+  catch (_) { return {}; }
+}
+
+function getAgent(repo) {
+  const a = agentRegistry()[repo];
+  if (!a) return null;
+  const slug = repo.replace('/', '-');
+  return {
+    repo, slug,
+    name: a.name || slug,
+    persona: typeof a.persona === 'string' ? a.persona : '',
+    notesPath: path.join(AGENTS_DIR, slug, 'notes.md'),
+  };
+}
+
+// Identity + memory preamble, prepended to every prompt of a registered repo.
+function agentPreamble(agent) {
+  if (!agent) return '';
+  let notes = '';
+  try { notes = fs.readFileSync(agent.notesPath, 'utf8').slice(0, NOTES_INJECT_MAX); } catch (_) {}
+  return `You are "${agent.name}", the dedicated maintainer agent of this repository (${agent.repo}). You have worked on it before and will work on it again.${agent.persona ? '\n' + agent.persona : ''}
+
+YOUR NOTES from previous runs (your only memory across runs):
+${notes.trim() || '(none yet — this is your first remembered run)'}
+
+If this run taught you something durable about the repo (build quirks, conventions, pitfalls, in-flight work), end your final message with a fenced block containing the COMPLETE UPDATED notes — it replaces the whole file, so keep whatever above is still true and stay under ${NOTES_STORE_MAX} bytes:
+\`\`\`ragent-notes
+<full updated notes>
+\`\`\`
+Otherwise omit the block entirely.
+
+--- THE TASK ---
+
+`;
+}
+
+// Extract a ```ragent-notes``` block from the agent's output: persist it (if
+// the repo has a registered agent) and return the output with the block
+// stripped, so it never leaks into issue replies.
+function absorbNotes(agent, out) {
+  const s = String(out || '');
+  const m = s.match(/```ragent-notes\s*\n([\s\S]*?)```/i);
+  if (!m) return s;
+  const stripped = (s.slice(0, m.index) + s.slice(m.index + m[0].length)).trim();
+  if (!agent) return stripped;
+  try {
+    fs.mkdirSync(path.dirname(agent.notesPath), { recursive: true });
+    fs.writeFileSync(agent.notesPath, m[1].slice(0, NOTES_STORE_MAX));
+    console.error(`[agent] ${agent.name}: notes updated (${m[1].length}B)`);
+  } catch (e) {
+    console.error(`[agent] ${agent.name}: notes write failed: ${e.message}`);
+  }
+  return stripped;
+}
+
 // ── Dispatch scheduler: in-process semaphore + queue + per-PR dedup ─────────
 // Single Node process, so concurrency is a counter, not an external queue.
 // Default serial (DISPATCH_CONCURRENCY=1): one small container + one shared
@@ -176,6 +245,10 @@ const DISPATCH_QUEUE_MAX = Number(process.env.DISPATCH_QUEUE_MAX || 20);
 let dispatchActive = 0;
 const dispatchQueue = [];
 const dispatchInflight = new Set(); // "repo#pr" — dedup key (queued or running)
+const activeRepos = new Set();      // per-repo serialization: one run per repo at
+                                    // a time (worktrees share the repo's cache
+                                    // clone; concurrent fetch/worktree ops on it
+                                    // would race), different repos in parallel.
 
 function enqueueDispatch(p) {
   const key = p.kind === 'implement' ? `${p.repo}#issue-${p.issue_number}`
@@ -201,15 +274,23 @@ function enqueueDispatch(p) {
 }
 
 function pumpDispatch() {
-  while (dispatchActive < DISPATCH_MAX && dispatchQueue.length) {
-    const job = dispatchQueue.shift();
+  let i = 0;
+  while (dispatchActive < DISPATCH_MAX && i < dispatchQueue.length) {
+    if (activeRepos.has(dispatchQueue[i].payload.repo)) { i++; continue; }
+    const job = dispatchQueue.splice(i, 1)[0];
     dispatchActive++;
+    activeRepos.add(job.payload.repo);
     const runner = job.payload.kind === 'implement' ? runImplement
       : job.payload.kind === 'converse' ? runConverse
       : runDispatch;
     runner(job.payload)
       .catch((e) => console.error(`[dispatch] ${job.key} failed:`, e.message))
-      .finally(() => { dispatchActive--; dispatchInflight.delete(job.key); pumpDispatch(); });
+      .finally(() => {
+        dispatchActive--;
+        activeRepos.delete(job.payload.repo);
+        dispatchInflight.delete(job.key);
+        pumpDispatch();
+      });
   }
 }
 
@@ -325,10 +406,11 @@ async function runDispatch(p) {
   execSync(`git -C '${shellEscape(dir)}' config user.name '${shellEscape(DISPATCH_AUTHOR_NAME)}'`, { stdio: 'ignore' });
   if (DISPATCH_AUTHOR_EMAIL) execSync(`git -C '${shellEscape(dir)}' config user.email '${shellEscape(DISPATCH_AUTHOR_EMAIL)}'`, { stdio: 'ignore' });
 
+  const agent = getAgent(p.repo);
   const findingsText = (p.findings || [])
     .map((f, i) => `${i + 1}. [${f.severity}] ${f.title}\n   ${f.detail || ''}${f.repro_steps && f.repro_steps.length ? `\n   Repro: ${f.repro_steps.join(' → ')}` : ''}`)
     .join('\n');
-  const prompt = `You are fixing a pull request. Probe (an acceptance agent) tested PR #${p.pr_number} on its preview deployment and found these issues:
+  const prompt = agentPreamble(agent) + `You are fixing a pull request. Probe (an acceptance agent) tested PR #${p.pr_number} on its preview deployment and found these issues:
 
 ${findingsText}
 
@@ -342,7 +424,7 @@ Fix ONLY these reported issues in this repository. Do not make unrelated changes
   // container; the SDK npm package isn't in the production deps). Prompt via
   // stdin; the CLI uses the container's existing Claude auth.
   try {
-    const out = await runClaudeP(prompt, dir);
+    const out = absorbNotes(agent, await runClaudeP(prompt, dir));
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude finished: ${String(out).slice(-300)}`);
     const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(p.branch)}..HEAD'`, { encoding: 'utf8' }).trim();
     if (ahead === '0' || ahead === '') {
@@ -383,7 +465,8 @@ async function runImplement(p) {
   execSync(`git -C '${shellEscape(dir)}' config user.name '${shellEscape(DISPATCH_AUTHOR_NAME)}'`, { stdio: 'ignore' });
   if (DISPATCH_AUTHOR_EMAIL) execSync(`git -C '${shellEscape(dir)}' config user.email '${shellEscape(DISPATCH_AUTHOR_EMAIL)}'`, { stdio: 'ignore' });
 
-  const prompt = `You are responding to a GitHub issue in this repository. Decide which case applies:
+  const agent = getAgent(p.repo);
+  const prompt = agentPreamble(agent) + `You are responding to a GitHub issue in this repository. Decide which case applies:
 
 ISSUE #${p.issue_number}: ${p.title}
 
@@ -401,7 +484,7 @@ CASE B — the issue is a QUESTION, a status/progress request, a discussion, or 
 Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final message is posted as an issue comment.`;
 
   try {
-    const out = await runClaudeP(prompt, dir);
+    const out = absorbNotes(agent, await runClaudeP(prompt, dir));
     console.error(`[implement] issue#${p.issue_number} claude finished: ${String(out).slice(-300)}`);
 
     const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(base)}..HEAD'`, { encoding: 'utf8' }).trim();
@@ -410,12 +493,12 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
       // issue with the agent's final message instead of opening an empty PR.
       console.error(`[implement] issue#${p.issue_number}: no commits → replying as issue comment`);
       const reply = String(out || '').trim() || '(the agent produced no actionable change and no response)';
-      await postIssueComment(p, reply, `replied to #${p.issue_number}; no code change needed`);
+      await postIssueComment(p, reply, `replied to #${p.issue_number}; no code change needed`, agent);
       return;
     }
     // probe/issue-N is owned by this flow — a re-run legitimately rewrites it.
     execSync(`git -C '${shellEscape(dir)}' push --force '${shellEscape(authUrl(p.repo))}' 'HEAD:refs/heads/${shellEscape(branch)}'`, { stdio: 'ignore' });
-    await openPullRequest(p, branch, base);
+    await openPullRequest(p, branch, base, agent);
   } catch (e) {
     console.error(`[implement] issue#${p.issue_number} error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
     throw e;
@@ -461,11 +544,15 @@ function githubPost(apiPath, payload, attempt = 1) {
   });
 }
 
-// Post a comment on the issue (Case B reply, or a converse reply).
-async function postIssueComment(p, body, footer) {
+// Post a comment on the issue (Case B reply, or a converse reply). The
+// signature keeps the literal "🤖 Ragent" marker — the webhook's self-reply
+// filter matches on it — and adds the agent's name for registered repos so
+// humans can tell which agent is speaking.
+async function postIssueComment(p, body, footer, agent) {
   const capped = body.length > 60000 ? body.slice(0, 60000) + '\n\n…(truncated)' : body;
   const note = footer || `replied to #${p.issue_number}`;
-  const payload = JSON.stringify({ body: `${capped}\n\n— 🤖 Ragent (${note})` });
+  const who = agent ? `Ragent[${agent.name}]` : 'Ragent';
+  const payload = JSON.stringify({ body: `${capped}\n\n— 🤖 ${who} (${note})` });
   const r = await githubPost(`/repos/${p.repo}/issues/${p.issue_number}/comments`, payload);
   if (r.ok) console.error(`[dispatch] issue#${p.issue_number} → posted reply comment`);
   else console.error(`[dispatch] issue#${p.issue_number} comment failed → ${r.status || r.error}: ${(r.body || '').slice(0, 200)}`);
@@ -473,11 +560,12 @@ async function postIssueComment(p, body, footer) {
 
 // Open a PR via the GitHub API. Idempotent: a 422 (PR already exists for this
 // head) on a re-run is fine.
-async function openPullRequest(p, head, base) {
+async function openPullRequest(p, head, base, agent) {
+  const who = agent ? `Ragent[${agent.name}]` : 'Ragent';
   const payload = JSON.stringify({
     title: p.title || `Implement issue #${p.issue_number}`,
     head, base,
-    body: `Implements #${p.issue_number}.\n\nCloses #${p.issue_number}\n\n— generated by Ragent from the issue; Probe will verify the preview.`,
+    body: `Implements #${p.issue_number}.\n\nCloses #${p.issue_number}\n\n— generated by ${who} from the issue; Probe will verify the preview.`,
   });
   const r = await githubPost(`/repos/${p.repo}/pulls`, payload);
   if (r.ok) {
@@ -503,9 +591,10 @@ async function runConverse(p) {
   execSync(`git -C '${shellEscape(cacheDir)}' worktree add --force --detach '${shellEscape(dir)}' FETCH_HEAD`, { stdio: 'ignore' });
 
   try {
+    const agent = getAgent(p.repo);
     const thread = await getIssueThread(p);
     const threadText = thread.map((c) => `[@${c.author}]: ${c.body}`).join('\n\n---\n\n');
-    const prompt = `You are taking part in an ongoing discussion on a GitHub issue in this repository. Read the repo (code/docs) to ground your answer.
+    const prompt = agentPreamble(agent) + `You are taking part in an ongoing discussion on a GitHub issue in this repository. Read the repo (code/docs) to ground your answer.
 
 ISSUE #${p.issue_number}: ${p.title}
 
@@ -528,7 +617,7 @@ BODY: <a clear, self-contained spec a coding agent can implement directly — wh
 
 Otherwise output ONLY the reply itself — no preamble, no meta-commentary, no block.`;
 
-    const out = await runClaudeP(prompt, dir);
+    const out = absorbNotes(agent, await runClaudeP(prompt, dir));
     let reply = String(out || '').trim() || '(no response generated)';
 
     // Spin-off: if the agent emitted a ragent:open-issue block, open a new
@@ -546,7 +635,7 @@ Otherwise output ONLY the reply itself — no preamble, no meta-commentary, no b
         ? `\n\n📋 已开 #${num}（已打 \`${ISSUE_LABEL}\` label，将自动实现）。`
         : `\n\n⚠️ 想开发开 issue，但创建失败了（token 需 Issues:write，label \`${ISSUE_LABEL}\` 需存在）。`;
     }
-    await postIssueComment(p, reply, `replied to #${p.issue_number}`);
+    await postIssueComment(p, reply, `replied to #${p.issue_number}`, agent);
     console.error(`[converse] issue#${p.issue_number} replied${blk ? ' (+ spun off issue)' : ''}`);
   } catch (e) {
     console.error(`[converse] issue#${p.issue_number} error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-200) : ''}`);
