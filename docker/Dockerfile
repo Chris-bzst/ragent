@@ -36,6 +36,9 @@ COPY backend/ ./
 # Copy frontend
 COPY frontend/ /app/frontend/
 
+# Orchestrator docs, seeded into /workspace by the entrypoint if absent
+COPY docker/docs/ /app/docs/
+
 # Copy and prepare entrypoint script
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

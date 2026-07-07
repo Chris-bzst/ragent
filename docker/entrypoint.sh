@@ -88,6 +88,25 @@ EOF
 fi
 chmod 600 /workspace/.claude/settings.json
 
+# Seed orchestrator docs — only if absent, so user edits survive restarts.
+# ORCHESTRATOR.md teaches the interactive terminal session how to delegate to
+# per-repo agents; the CLAUDE.md pointer makes every session aware of it.
+if [ ! -f /workspace/ORCHESTRATOR.md ] && [ -f /app/docs/ORCHESTRATOR.md ]; then
+    cp /app/docs/ORCHESTRATOR.md /workspace/ORCHESTRATOR.md
+fi
+if [ ! -f /workspace/.claude/CLAUDE.md ]; then
+    cat > /workspace/.claude/CLAUDE.md << 'EOF'
+# Ragent instance memory
+
+- If you are the interactive terminal session (cwd is `/workspace` or a project
+  under it, but NOT under `/workspace/dispatch/`): you are this instance's
+  orchestrator — before delegating work to per-repo agents or planning
+  multi-repo tasks, read `/workspace/ORCHESTRATOR.md`.
+- If you are a dispatch run (cwd under `/workspace/dispatch/`): ignore the line
+  above; your instructions are in your prompt.
+EOF
+fi
+
 echo "Configuration completed"
 
 # ==================== Fix ownership ====================
