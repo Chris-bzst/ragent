@@ -169,6 +169,15 @@ app.post('/webhooks/github', express.raw({ type: '*/*', limit: '2mb' }), (req, r
       if (/🤖 Ragent/.test(body)) return;                   // never answer our own reply
       const m = body.match(/^\s*\/ragent\b[ \t]*([\s\S]*)$/i);
       if (!m) return;
+      // Only repo insiders may drive the agent. On private repos this is
+      // inert (every commenter is a collaborator); on public repos it is the
+      // gate that keeps strangers' comments from reaching agent prompts.
+      const assoc = (pl.comment && pl.comment.author_association) || 'NONE';
+      if (!['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc)) {
+        const who = (pl.comment && pl.comment.user && pl.comment.user.login) || 'unknown';
+        console.error(`[webhook] /ragent from @${who} (${assoc}) on ${repo}#${issue.number} ignored`);
+        return;
+      }
       const request = (m[1] || '').trim();
       if (issue.pull_request) {
         // /ragent on a PR → MANUAL fix request on the PR branch. The manual
