@@ -121,10 +121,14 @@ app.post('/webhooks/github', express.raw({ type: '*/*', limit: '2mb' }), (req, r
         ? (pl.label && pl.label.name === ISSUE_LABEL)
         : (issue.labels || []).some((l) => l && l.name === ISSUE_LABEL);
       if (!hasLabel) return;
+      // Carry delegation metadata (if this issue was opened by another agent's
+      // ragent-request or a spin-off) so depth counting survives the hop.
+      const meta = parseMeta(issue.body);
       enqueueDispatch({
         kind: 'implement', repo, issue_number: issue.number,
         title: issue.title || '', body: issue.body || '',
         base_branch: (pl.repository && pl.repository.default_branch) || 'main',
+        depth: meta.depth, origin: meta.origin,
       });
     } else if (event === 'issue_comment') {
       if (pl.action !== 'created') return;
@@ -152,11 +156,13 @@ app.post('/webhooks/github', express.raw({ type: '*/*', limit: '2mb' }), (req, r
         }).catch((e) => console.error('[webhook] PR fix error:', e.message));
       } else {
         // /ragent on an issue → conversation.
+        const meta = parseMeta(issue.body);
         enqueueDispatch({
           kind: 'converse', repo, issue_number: issue.number,
           comment_id: (pl.comment && pl.comment.id) || 0,
           title: issue.title || '', body: issue.body || '',
           request,
+          depth: meta.depth, origin: meta.origin,
         });
       }
     }
@@ -194,12 +200,26 @@ function getAgent(repo) {
   };
 }
 
-// Identity + memory preamble, prepended to every prompt of a registered repo.
-function agentPreamble(agent) {
+// Identity + memory + peers preamble, prepended to every prompt of a
+// registered repo. `p` supplies the delegation depth of the current task.
+function agentPreamble(agent, p) {
   if (!agent) return '';
   let notes = '';
   try { notes = fs.readFileSync(agent.notesPath, 'utf8').slice(0, NOTES_INJECT_MAX); } catch (_) {}
-  return `You are "${agent.name}", the dedicated maintainer agent of this repository (${agent.repo}). You have worked on it before and will work on it again.${agent.persona ? '\n' + agent.persona : ''}
+  const depth = Number((p && p.depth) || 0);
+  const peers = Object.keys(agentRegistry()).filter((r) => r !== agent.repo);
+  const peersBlock = peers.length ? `
+
+PEER REPOSITORIES, each maintained by its own agent: ${peers.join(', ')}.
+You can NEVER touch their code. If your task genuinely requires a change in one of them, file a work request — emit (before any notes block):
+\`\`\`ragent-request
+{"repo": "<one of the peers>", "title": "<concise title>", "body": "<self-contained spec the other agent can act on without extra context>"}
+\`\`\`
+The server opens a labeled issue in that repo, waking its agent; the outcome will be reported back here.` : '';
+  const depthNote = depth > 0
+    ? `\nThis task was delegated to you by another agent (delegation depth ${depth}/${MAX_REQUEST_DEPTH}).`
+    : '';
+  return `You are "${agent.name}", the dedicated maintainer agent of this repository (${agent.repo}). You have worked on it before and will work on it again.${agent.persona ? '\n' + agent.persona : ''}${depthNote}${peersBlock}
 
 YOUR NOTES from previous runs (your only memory across runs):
 ${notes.trim() || '(none yet — this is your first remembered run)'}
@@ -232,6 +252,77 @@ function absorbNotes(agent, out) {
     console.error(`[agent] ${agent.name}: notes write failed: ${e.message}`);
   }
   return stripped;
+}
+
+// ── Cross-repo requests: GitHub as the message bus ──────────────────────────
+// An agent never touches another repo directly. Its only cross-repo action is
+// emitting a ```ragent-request``` block, which the server turns into a labeled
+// issue in the target repo — waking that repo's own agent, the only write path
+// to it. Every such issue carries origin+depth metadata in an HTML comment;
+// past MAX_REQUEST_DEPTH the server refuses to open further issues, so
+// delegation chains terminate instead of looping.
+const MAX_REQUEST_DEPTH = Number(process.env.RAGENT_MAX_DEPTH || 3);
+
+function metaComment(origin, depth) {
+  return `<!-- ragent-meta ${JSON.stringify({ origin, depth })} -->`;
+}
+
+function parseMeta(body) {
+  const m = String(body || '').match(/<!--\s*ragent-meta\s*(\{[\s\S]*?\})\s*-->/);
+  if (!m) return { origin: null, depth: 0 };
+  try {
+    const j = JSON.parse(m[1]);
+    return { origin: typeof j.origin === 'string' ? j.origin : null, depth: Number(j.depth) || 0 };
+  } catch (_) { return { origin: null, depth: 0 }; }
+}
+
+// Extract ```ragent-request``` blocks from the agent's output; open a labeled
+// issue in each valid target repo. Returns the output with blocks stripped and
+// human-readable result lines to append to any posted reply. Requests are only
+// honored from registered agents, toward registered peers, within the depth cap.
+async function absorbRequests(agent, p, out) {
+  let text = String(out || '');
+  const blocks = [...text.matchAll(/```ragent-request\s*\n([\s\S]*?)```/gi)];
+  const results = [];
+  if (!blocks.length) return { text, results };
+  const registry = agentRegistry();
+  const srcRef = `${p.repo}#${p.issue_number || p.pr_number}`;
+  const depth = (Number(p.depth) || 0) + 1;
+  for (const b of blocks.slice(0, 3)) { // hard cap on requests per run
+    text = text.replace(b[0], '').trim();
+    let req; try { req = JSON.parse(b[1]); } catch (_) { req = null; }
+    const target = req ? String(req.repo || '') : '';
+    if (!req || !/^[\w.-]+\/[\w.-]+$/.test(target)) { results.push('⚠️ malformed ragent-request (need JSON {repo,title,body})'); continue; }
+    if (!agent) { results.push(`⚠️ ragent-request refused: this repo has no registered agent`); continue; }
+    if (target === p.repo) { results.push('⚠️ ragent-request to own repo ignored'); continue; }
+    if (!registry[target]) { results.push(`⚠️ ragent-request to ${target} refused: no registered agent there`); continue; }
+    if (depth > MAX_REQUEST_DEPTH) {
+      console.error(`[request] ${srcRef} → ${target} refused (delegation depth ${depth} > ${MAX_REQUEST_DEPTH})`);
+      results.push(`⚠️ ragent-request to ${target} refused: delegation depth limit (${MAX_REQUEST_DEPTH}) reached`);
+      continue;
+    }
+    const title = String(req.title || `Request from ${srcRef}`).slice(0, 200);
+    const body = `${String(req.body || '')}\n\n— requested by 🤖 Ragent[${agent.name}] from ${srcRef}\n\n${metaComment(srcRef, depth)}`;
+    const num = await openIssue(target, title, body, [ISSUE_LABEL]);
+    results.push(num
+      ? `📨 requested work from ${target}'s agent → ${target}#${num}`
+      : `⚠️ ragent-request to ${target} failed (could not open issue)`);
+  }
+  return { text, results };
+}
+
+// Close the delegation loop: after handling a requested issue, report the
+// outcome on the origin issue. The literal 🤖 Ragent marker keeps the origin
+// repo's webhook from re-triggering on this comment (no comment ping-pong);
+// the origin agent picks it up from the thread on its next run.
+async function notifyOrigin(p, message) {
+  if (!p.origin) return;
+  const m = String(p.origin).match(/^([\w.-]+\/[\w.-]+)#(\d+)$/);
+  if (!m) return;
+  const payload = JSON.stringify({ body: `${message}\n\n— 🤖 Ragent (update from ${p.repo}#${p.issue_number})` });
+  const r = await githubPost(`/repos/${m[1]}/issues/${m[2]}/comments`, payload);
+  if (r.ok) console.error(`[request] notified origin ${p.origin}`);
+  else console.error(`[request] notify ${p.origin} failed → ${r.status || r.error}: ${(r.body || '').slice(0, 200)}`);
 }
 
 // ── Dispatch scheduler: in-process semaphore + queue + per-PR dedup ─────────
@@ -284,7 +375,7 @@ function pumpDispatch() {
       : job.payload.kind === 'converse' ? runConverse
       : runDispatch;
     runner(job.payload)
-      .catch((e) => console.error(`[dispatch] ${job.key} failed:`, e.message))
+      .catch((e) => console.error(`[dispatch] ${job.key} failed:`, scrubToken(e.message)))
       .finally(() => {
         dispatchActive--;
         activeRepos.delete(job.payload.repo);
@@ -410,7 +501,7 @@ async function runDispatch(p) {
   const findingsText = (p.findings || [])
     .map((f, i) => `${i + 1}. [${f.severity}] ${f.title}\n   ${f.detail || ''}${f.repro_steps && f.repro_steps.length ? `\n   Repro: ${f.repro_steps.join(' → ')}` : ''}`)
     .join('\n');
-  const prompt = agentPreamble(agent) + `You are fixing a pull request. Probe (an acceptance agent) tested PR #${p.pr_number} on its preview deployment and found these issues:
+  const prompt = agentPreamble(agent, p) + `You are fixing a pull request. Probe (an acceptance agent) tested PR #${p.pr_number} on its preview deployment and found these issues:
 
 ${findingsText}
 
@@ -424,8 +515,9 @@ Fix ONLY these reported issues in this repository. Do not make unrelated changes
   // container; the SDK npm package isn't in the production deps). Prompt via
   // stdin; the CLI uses the container's existing Claude auth.
   try {
-    const out = absorbNotes(agent, await runClaudeP(prompt, dir));
-    console.error(`[dispatch] ${p.repo}#${p.pr_number} claude finished: ${String(out).slice(-300)}`);
+    const reqs = await absorbRequests(agent, p, absorbNotes(agent, await runClaudeP(prompt, dir)));
+    reqs.results.forEach((r) => console.error(`[dispatch] ${p.repo}#${p.pr_number} ${r}`));
+    console.error(`[dispatch] ${p.repo}#${p.pr_number} claude finished: ${reqs.text.slice(-300)}`);
     const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(p.branch)}..HEAD'`, { encoding: 'utf8' }).trim();
     if (ahead === '0' || ahead === '') {
       console.error(`[dispatch] ${p.repo}#${p.pr_number}: agent made no commits — nothing to push`);
@@ -433,7 +525,7 @@ Fix ONLY these reported issues in this repository. Do not make unrelated changes
       pushBranch(dir, p.repo, p.branch, `${p.repo}#${p.pr_number}`);
     }
   } catch (e) {
-    console.error(`[dispatch] ${p.repo}#${p.pr_number} claude error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
+    console.error(`[dispatch] ${p.repo}#${p.pr_number} claude error: ${scrubToken(e.message)}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
     throw e;
   } finally {
     // Release the worktree (and its disk) on every path; the cache object store
@@ -466,7 +558,7 @@ async function runImplement(p) {
   if (DISPATCH_AUTHOR_EMAIL) execSync(`git -C '${shellEscape(dir)}' config user.email '${shellEscape(DISPATCH_AUTHOR_EMAIL)}'`, { stdio: 'ignore' });
 
   const agent = getAgent(p.repo);
-  const prompt = agentPreamble(agent) + `You are responding to a GitHub issue in this repository. Decide which case applies:
+  const prompt = agentPreamble(agent, p) + `You are responding to a GitHub issue in this repository. Decide which case applies:
 
 ISSUE #${p.issue_number}: ${p.title}
 
@@ -484,7 +576,8 @@ CASE B — the issue is a QUESTION, a status/progress request, a discussion, or 
 Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final message is posted as an issue comment.`;
 
   try {
-    const out = absorbNotes(agent, await runClaudeP(prompt, dir));
+    const reqs = await absorbRequests(agent, p, absorbNotes(agent, await runClaudeP(prompt, dir)));
+    const out = reqs.text;
     console.error(`[implement] issue#${p.issue_number} claude finished: ${String(out).slice(-300)}`);
 
     const ahead = execSync(`git -C '${shellEscape(dir)}' rev-list --count 'origin/${shellEscape(base)}..HEAD'`, { encoding: 'utf8' }).trim();
@@ -492,15 +585,22 @@ Pick exactly one. Committing ⇒ a PR is opened. No commit ⇒ your final messag
       // No code change (Case B: question / status / can't act) → reply on the
       // issue with the agent's final message instead of opening an empty PR.
       console.error(`[implement] issue#${p.issue_number}: no commits → replying as issue comment`);
-      const reply = String(out || '').trim() || '(the agent produced no actionable change and no response)';
+      let reply = String(out || '').trim() || '(the agent produced no actionable change and no response)';
+      if (reqs.results.length) reply += '\n\n' + reqs.results.join('\n');
       await postIssueComment(p, reply, `replied to #${p.issue_number}; no code change needed`, agent);
+      await notifyOrigin(p, `Replied on ${p.repo}#${p.issue_number} — no code change was needed.`);
       return;
     }
     // probe/issue-N is owned by this flow — a re-run legitimately rewrites it.
     execSync(`git -C '${shellEscape(dir)}' push --force '${shellEscape(authUrl(p.repo))}' 'HEAD:refs/heads/${shellEscape(branch)}'`, { stdio: 'ignore' });
-    await openPullRequest(p, branch, base, agent);
+    const prNum = await openPullRequest(p, branch, base, agent);
+    await notifyOrigin(p, prNum
+      ? `Handled ${p.repo}#${p.issue_number}: opened PR https://github.com/${p.repo}/pull/${prNum}`
+      : `Handled ${p.repo}#${p.issue_number}: pushed branch \`${branch}\` (PR may already exist)`);
   } catch (e) {
-    console.error(`[implement] issue#${p.issue_number} error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
+    console.error(`[implement] issue#${p.issue_number} error: ${scrubToken(e.message)}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
+    // Don't leave the requesting agent waiting on a silent failure.
+    notifyOrigin(p, `⚠️ Failed to handle ${p.repo}#${p.issue_number}: ${scrubToken(e.message)}`).catch(() => {});
     throw e;
   } finally {
     try {
@@ -571,9 +671,10 @@ async function openPullRequest(p, head, base, agent) {
   if (r.ok) {
     let num; try { num = JSON.parse(r.body).number; } catch (_) {}
     console.error(`[implement] issue#${p.issue_number} → opened PR #${num} (${head} → ${base})`);
-  } else {
-    console.error(`[implement] issue#${p.issue_number} open PR → ${r.status || r.error}: ${(r.body || '').slice(0, 200)}`);
+    return num || null;
   }
+  console.error(`[implement] issue#${p.issue_number} open PR → ${r.status || r.error}: ${(r.body || '').slice(0, 200)}`);
+  return null;
 }
 
 // Conversation path: read the repo + the whole issue thread, answer the latest
@@ -594,7 +695,7 @@ async function runConverse(p) {
     const agent = getAgent(p.repo);
     const thread = await getIssueThread(p);
     const threadText = thread.map((c) => `[@${c.author}]: ${c.body}`).join('\n\n---\n\n');
-    const prompt = agentPreamble(agent) + `You are taking part in an ongoing discussion on a GitHub issue in this repository. Read the repo (code/docs) to ground your answer.
+    const prompt = agentPreamble(agent, p) + `You are taking part in an ongoing discussion on a GitHub issue in this repository. Read the repo (code/docs) to ground your answer.
 
 ISSUE #${p.issue_number}: ${p.title}
 
@@ -617,28 +718,36 @@ BODY: <a clear, self-contained spec a coding agent can implement directly — wh
 
 Otherwise output ONLY the reply itself — no preamble, no meta-commentary, no block.`;
 
-    const out = absorbNotes(agent, await runClaudeP(prompt, dir));
-    let reply = String(out || '').trim() || '(no response generated)';
+    const reqs = await absorbRequests(agent, p, absorbNotes(agent, await runClaudeP(prompt, dir)));
+    let reply = reqs.text.trim() || '(no response generated)';
 
     // Spin-off: if the agent emitted a ragent:open-issue block, open a new
     // development issue (auto-labeled so Ragent's own webhook then implements it),
-    // strip the block from the reply, and link the new issue.
+    // strip the block from the reply, and link the new issue. The spin-off
+    // carries origin/depth metadata like a cross-repo request: chains that pass
+    // through same-repo spin-offs still count against the delegation cap.
     const blk = reply.match(/```ragent:open-issue\s*([\s\S]*?)```/i);
     if (blk) {
       const t = blk[1].match(/TITLE:\s*(.+)/i);
       const b = blk[1].match(/BODY:\s*([\s\S]*)/i);
       const title = (t && t[1].trim()) || `Task from #${p.issue_number}`;
-      const issueBody = ((b && b[1].trim()) || '') + `\n\n— spun off from #${p.issue_number} by 🤖 Ragent`;
+      const spinDepth = (Number(p.depth) || 0) + 1;
+      const issueBody = ((b && b[1].trim()) || '') +
+        `\n\n— spun off from #${p.issue_number} by 🤖 Ragent\n\n${metaComment(`${p.repo}#${p.issue_number}`, spinDepth)}`;
       reply = reply.replace(blk[0], '').trim();
-      const num = await openIssue(p.repo, title, issueBody, [ISSUE_LABEL]);
+      const num = spinDepth > MAX_REQUEST_DEPTH ? null
+        : await openIssue(p.repo, title, issueBody, [ISSUE_LABEL]);
       reply += num
         ? `\n\n📋 已开 #${num}（已打 \`${ISSUE_LABEL}\` label，将自动实现）。`
-        : `\n\n⚠️ 想开发开 issue，但创建失败了（token 需 Issues:write，label \`${ISSUE_LABEL}\` 需存在）。`;
+        : spinDepth > MAX_REQUEST_DEPTH
+          ? `\n\n⚠️ 想开发开 issue，但委托链已达深度上限（${MAX_REQUEST_DEPTH}），未创建。`
+          : `\n\n⚠️ 想开发开 issue，但创建失败了（token 需 Issues:write，label \`${ISSUE_LABEL}\` 需存在）。`;
     }
+    if (reqs.results.length) reply += '\n\n' + reqs.results.join('\n');
     await postIssueComment(p, reply, `replied to #${p.issue_number}`, agent);
     console.error(`[converse] issue#${p.issue_number} replied${blk ? ' (+ spun off issue)' : ''}`);
   } catch (e) {
-    console.error(`[converse] issue#${p.issue_number} error: ${e.message}${e.stdout ? ' | out: ' + String(e.stdout).slice(-200) : ''}`);
+    console.error(`[converse] issue#${p.issue_number} error: ${scrubToken(e.message)}${e.stdout ? ' | out: ' + String(e.stdout).slice(-200) : ''}`);
     throw e;
   } finally {
     try {
