@@ -561,6 +561,7 @@ The remote is already authenticated. If the push is rejected because the branch 
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude finished: ${reqs.text.slice(-300)}`);
   } catch (e) {
     console.error(`[dispatch] ${p.repo}#${p.pr_number} claude error: ${scrubToken(e.message)}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
+    reportRunFailure(p, e).catch(() => {});
     throw e;
   } finally {
     // Release the worktree (and its disk) on every path; the cache object store
@@ -645,6 +646,7 @@ THIS repository is your only scope — never use your git credentials against an
     console.error(`[implement] issue#${p.issue_number} error: ${scrubToken(e.message)}${e.stdout ? ' | out: ' + String(e.stdout).slice(-300) : ''}`);
     // Don't leave the requesting agent waiting on a silent failure.
     notifyOrigin(p, `⚠️ Failed to handle ${p.repo}#${p.issue_number}: ${scrubToken(e.message)}`).catch(() => {});
+    reportRunFailure(p, e).catch(() => {});
     throw e;
   } finally {
     try {
@@ -700,6 +702,40 @@ async function postIssueComment(p, body, footer, agent) {
   const r = await githubPost(`/repos/${p.repo}/issues/${p.issue_number}/comments`, payload);
   if (r.ok) console.error(`[dispatch] issue#${p.issue_number} → posted reply comment`);
   else console.error(`[dispatch] issue#${p.issue_number} comment failed → ${r.status || r.error}: ${(r.body || '').slice(0, 200)}`);
+}
+
+// Report a runner failure (claude error, timeout, git/API throw) on the
+// driving surface — the issue for implement/converse jobs, the PR for fix
+// jobs (the issue-comments API works for PRs too). A human-opened issue would
+// otherwise sit silently "in progress" forever with the failure only in
+// server stderr. Skips posting if a `<!-- ragent-run-failed -->` comment is
+// already there, so a repeatedly-failing issue doesn't collect one comment
+// per retry. Never throws — a broken notification must not mask the
+// original error.
+async function reportRunFailure(p, e) {
+  try {
+    const number = p.issue_number || p.pr_number;
+    if (!number || !p.repo) return;
+    const existing = await githubGet(`/repos/${p.repo}/issues/${number}/comments?per_page=100`);
+    let comments = [];
+    if (existing.ok) { try { comments = JSON.parse(existing.body); } catch (_) { comments = []; } }
+    if (Array.isArray(comments) && comments.some((c) => /<!--\s*ragent-run-failed\s*-->/.test(c.body || ''))) {
+      console.error(`[dispatch] ${p.repo}#${number}: failure already reported, skipping duplicate comment`);
+      return;
+    }
+    const agent = getAgent(p.repo);
+    const who = agent ? `Ragent[${agent.name}]` : 'Ragent';
+    const reason = scrubToken((e && e.message) || String(e)).slice(0, 500);
+    const retryNote = p.kind === 'implement'
+      ? ' It will be retried automatically after the next server restart (the reconciliation sweep re-queues it).'
+      : '';
+    const body = `⚠️ Agent run failed: ${reason}${retryNote}\n\n<!-- ragent-run-failed -->\n\n— 🤖 ${who}`;
+    const r = await githubPost(`/repos/${p.repo}/issues/${number}/comments`, JSON.stringify({ body }));
+    if (r.ok) console.error(`[dispatch] ${p.repo}#${number}: posted run-failure comment`);
+    else console.error(`[dispatch] ${p.repo}#${number}: run-failure comment failed → ${r.status || r.error}`);
+  } catch (err) {
+    console.error(`[dispatch] reportRunFailure itself failed: ${scrubToken(err.message)}`);
+  }
 }
 
 // Open a PR via the GitHub API. Idempotent: a 422 (PR already exists for this
@@ -792,6 +828,7 @@ Otherwise output ONLY the reply itself — no preamble, no meta-commentary, no b
     console.error(`[converse] issue#${p.issue_number} replied${blk ? ' (+ spun off issue)' : ''}`);
   } catch (e) {
     console.error(`[converse] issue#${p.issue_number} error: ${scrubToken(e.message)}${e.stdout ? ' | out: ' + String(e.stdout).slice(-200) : ''}`);
+    reportRunFailure(p, e).catch(() => {});
     throw e;
   } finally {
     try {
@@ -900,7 +937,10 @@ async function reconcileSweep() {
         const commentsR = await githubGet(`/repos/${repo}/issues/${issue.number}/comments?per_page=100`);
         let comments = [];
         if (commentsR.ok) { try { comments = JSON.parse(commentsR.body); } catch (_) { comments = []; } }
-        if (Array.isArray(comments) && comments.some((c) => /🤖 Ragent/.test(c.body || ''))) continue; // already replied
+        // A `ragent-run-failed` comment means the previous attempt never actually
+        // replied — don't let it count as "already handled", or the automatic
+        // retry this comment promises would never happen.
+        if (Array.isArray(comments) && comments.some((c) => /🤖 Ragent/.test(c.body || '') && !/<!--\s*ragent-run-failed\s*-->/.test(c.body || ''))) continue; // already replied
 
         const meta = parseMeta(issue.body);
         enqueueDispatch({
