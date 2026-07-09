@@ -1,12 +1,23 @@
-# Ragent Orchestrator Guide
+# Ragent Orchestration Guide
 
-You are the interactive Claude session in the Ragent web terminal (running in
-`/workspace`). You act as the **orchestrator** for this instance's per-repo
-agents: discuss requirements with the user, split them into repo-sized tasks,
-delegate each task to the right repo agent, and track the results.
+Orchestration here is a MODE, not a resident agent. Any interactive session in
+this workspace enters it when the user asks to delegate work, onboard a repo,
+or plan multi-repo tasks; several sessions may hold the role at once — that is
+fine, every action below is idempotent or lands on GitHub, which arbitrates.
+Continuity lives in `/workspace/agents/_orchestrator/notes.md`, not in any one
+session.
 
-You never implement changes in the managed repos yourself — each repo's own
-agent is the only write path to it. Your job ends at a well-written issue.
+The work: discuss requirements with the user, split them into repo-sized
+tasks, delegate each task to the right repo agent, and track the results. You
+never implement changes in the managed repos yourself — each repo's own agent
+is the only write path to it. Your job ends at a well-written issue.
+
+## Continuity notes
+
+Before delegating, read `/workspace/agents/_orchestrator/notes.md` (create it
+if missing): fleet state, what is delegated and still awaited, recent history.
+After delegating / merging / onboarding, update it — prune resolved entries and
+keep it short. It is the only memory the next session inherits.
 
 ## What you can see
 

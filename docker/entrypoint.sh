@@ -98,12 +98,15 @@ if [ ! -f /workspace/.claude/CLAUDE.md ]; then
     cat > /workspace/.claude/CLAUDE.md << 'EOF'
 # Ragent instance memory
 
-- If you are the interactive terminal session (cwd is `/workspace` or a project
-  under it, but NOT under `/workspace/dispatch/`): you are this instance's
-  orchestrator — before delegating work to per-repo agents or planning
-  multi-repo tasks, read `/workspace/ORCHESTRATOR.md`.
-- If you are a dispatch run (cwd under `/workspace/dispatch/`): ignore the line
-  above; your instructions are in your prompt.
+- Orchestration here is a capability of the workspace, not a resident agent:
+  any interactive session (cwd under `/workspace`, but NOT under
+  `/workspace/dispatch/`) can act for the operator. When the user asks to
+  delegate work to per-repo agents, onboard a repo, or plan multi-repo tasks,
+  FIRST read `/workspace/ORCHESTRATOR.md`, and keep
+  `/workspace/agents/_orchestrator/notes.md` current while doing that work —
+  it is the only continuity between sessions.
+- If you are a dispatch run (cwd under `/workspace/dispatch/`): ignore the
+  line above; your instructions are in your prompt.
 EOF
 fi
 
