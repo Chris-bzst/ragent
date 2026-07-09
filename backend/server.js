@@ -816,13 +816,12 @@ async function openIssue(repo, title, body, labels) {
   return null;
 }
 
-// Resolve a PR's head branch name (https GET) — needed to fix the right branch
-// when a /ragent fix request comes in on a PR.
-function getPullBranch(repo, prNumber) {
+// GET from the GitHub API (same style/headers as githubPost). Never rejects.
+function githubGet(apiPath) {
   const https = require('https');
   return new Promise((resolve) => {
     const req = https.request({
-      hostname: 'api.github.com', path: `/repos/${repo}/pulls/${prNumber}`, method: 'GET',
+      hostname: 'api.github.com', path: apiPath, method: 'GET',
       headers: {
         Authorization: `Bearer ${ghToken()}`,
         Accept: 'application/vnd.github+json',
@@ -830,38 +829,92 @@ function getPullBranch(repo, prNumber) {
         'User-Agent': 'ragent-dispatch',
       },
     }, (res) => {
-      let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => {
-        try { const pr = JSON.parse(b); resolve(pr && pr.head && pr.head.ref); } catch (_) { resolve(null); }
-      });
+      let b = ''; res.on('data', (c) => (b += c)); res.on('end', () =>
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, body: b }));
     });
-    req.on('error', () => resolve(null));
+    req.on('error', (e) => resolve({ ok: false, status: 0, body: '', error: e.message }));
     req.end();
   });
 }
 
-// Fetch the issue's comment thread (https GET). Returns [{author, body}] oldest-first.
-function getIssueThread(p) {
-  const https = require('https');
-  return new Promise((resolve) => {
-    const req = https.request({
-      hostname: 'api.github.com', path: `/repos/${p.repo}/issues/${p.issue_number}/comments?per_page=100`, method: 'GET',
-      headers: {
-        Authorization: `Bearer ${ghToken()}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'ragent-dispatch',
-      },
-    }, (res) => {
-      let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => {
-        try {
-          const arr = JSON.parse(b);
-          resolve(Array.isArray(arr) ? arr.map((c) => ({ author: c.user && c.user.login, body: c.body || '' })) : []);
-        } catch (_) { resolve([]); }
-      });
-    });
-    req.on('error', () => resolve([]));
-    req.end();
-  });
+// Resolve a PR's head branch name — needed to fix the right branch when a
+// /ragent fix request comes in on a PR.
+async function getPullBranch(repo, prNumber) {
+  const r = await githubGet(`/repos/${repo}/pulls/${prNumber}`);
+  if (!r.ok) return null;
+  try { const pr = JSON.parse(r.body); return (pr && pr.head && pr.head.ref) || null; } catch (_) { return null; }
+}
+
+// Fetch the issue's comment thread. Returns [{author, body}] oldest-first.
+async function getIssueThread(p) {
+  const r = await githubGet(`/repos/${p.repo}/issues/${p.issue_number}/comments?per_page=100`);
+  if (!r.ok) return [];
+  try {
+    const arr = JSON.parse(r.body);
+    return Array.isArray(arr) ? arr.map((c) => ({ author: c.user && c.user.login, body: c.body || '' })) : [];
+  } catch (_) { return []; }
+}
+
+// ── Boot reconciliation sweep ────────────────────────────────────────────
+// GitHub is the source of truth, not the in-memory dispatch queue: a
+// container restart drops any queued/in-flight webhook work, and GitHub does
+// not retry failed/missed deliveries. On startup, re-derive the queue from
+// GitHub — for every registered repo, find open labeled issues that neither
+// have a probe branch nor a reply comment yet, and re-enqueue them exactly
+// like the webhook would. dispatchInflight's existing dedup makes this safe
+// to run even if a webhook for the same issue arrives concurrently.
+async function reconcileSweep() {
+  if (String(process.env.RAGENT_RECONCILE) === '0') {
+    console.error('[reconcile] disabled via RAGENT_RECONCILE=0');
+    return;
+  }
+  if (!ghToken()) return;
+  const repos = Object.keys(agentRegistry());
+  if (!repos.length) return;
+
+  for (const repo of repos) {
+    try {
+      const repoR = await githubGet(`/repos/${repo}`);
+      if (!repoR.ok) {
+        console.error(`[reconcile] ${repo}: repo lookup failed → ${repoR.status || repoR.error}`);
+        continue;
+      }
+      let baseBranch = 'main';
+      try { baseBranch = JSON.parse(repoR.body).default_branch || 'main'; } catch (_) {}
+
+      const issuesR = await githubGet(`/repos/${repo}/issues?labels=${encodeURIComponent(ISSUE_LABEL)}&state=open&per_page=100`);
+      if (!issuesR.ok) {
+        console.error(`[reconcile] ${repo}: issue lookup failed → ${issuesR.status || issuesR.error}`);
+        continue;
+      }
+      let issues;
+      try { issues = JSON.parse(issuesR.body); } catch (_) { issues = []; }
+      if (!Array.isArray(issues)) issues = [];
+      issues = issues.filter((i) => i && !i.pull_request); // the endpoint also returns PRs
+
+      let requeued = 0;
+      for (const issue of issues) {
+        const branchR = await githubGet(`/repos/${repo}/branches/probe/issue-${issue.number}`);
+        if (branchR.ok) continue; // an implement run already produced work
+
+        const commentsR = await githubGet(`/repos/${repo}/issues/${issue.number}/comments?per_page=100`);
+        let comments = [];
+        if (commentsR.ok) { try { comments = JSON.parse(commentsR.body); } catch (_) { comments = []; } }
+        if (Array.isArray(comments) && comments.some((c) => /🤖 Ragent/.test(c.body || ''))) continue; // already replied
+
+        const meta = parseMeta(issue.body);
+        enqueueDispatch({
+          kind: 'implement', repo, issue_number: issue.number,
+          title: issue.title || '', body: issue.body || '',
+          base_branch: baseBranch, depth: meta.depth, origin: meta.origin,
+        });
+        requeued++;
+      }
+      console.error(`[reconcile] ${repo}: checked ${issues.length}, requeued ${requeued}`);
+    } catch (e) {
+      console.error(`[reconcile] ${repo}: sweep error — ${scrubToken(e.message)}`);
+    }
+  }
 }
 
 // HTTP Basic Authentication (Optional)
@@ -1353,6 +1406,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Frontend: http://localhost:${PORT}`);
   console.log(`Health: http://localhost:${PORT}/health`);
   console.log(`Serving static assets from: ${staticRoot}`);
+  setTimeout(() => {
+    reconcileSweep().catch((e) => console.error('[reconcile] sweep failed:', scrubToken(e.message)));
+  }, 5000);
 });
 
 process.on('SIGTERM', () => {
