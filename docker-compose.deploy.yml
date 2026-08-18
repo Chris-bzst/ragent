@@ -34,7 +34,13 @@ services:
     mem_limit: 128m
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /home/ubuntu/.docker/config.json:/config.json:ro   # GHCR 拉取凭据
+      # No registry credentials on purpose: ghcr.io/chris-bzst/ragent is a
+      # PUBLIC package, so watchtower pulls it anonymously. It used to mount
+      # /home/ubuntu/.docker/config.json, whose classic PAT expired 30 days
+      # after it was written; watchtower then kept sending the dead token,
+      # GHCR answered 403, and watchtower gave up instead of falling back to
+      # anonymous -- silently blocking every deploy for a month. Credentials
+      # that are not needed can only break things.
     environment:
       - WATCHTOWER_LABEL_ENABLE=true    # 只看带 enable 标签的容器
       - WATCHTOWER_POLL_INTERVAL=60     # 每 60s 查一次 GHCR
