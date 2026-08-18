@@ -16,6 +16,13 @@ services:
       - ragent_workspace:/workspace
     restart: unless-stopped
     container_name: ragent
+    # tini as PID 1. The server runs `node server.js` as PID 1 otherwise, and
+    # node does not reap orphans -- every subprocess an agent orphans (claude,
+    # esbuild, vitest workers) becomes a permanent zombie holding a pid slot.
+    init: true
+    # Headroom for an agent running a real toolchain (pnpm, vitest forks one
+    # worker per CPU). Kept explicit so the ceiling is visible, not a surprise.
+    pids_limit: 2048
 
 volumes:
   ragent_workspace:
