@@ -475,18 +475,29 @@ function scrubToken(s) {
 function runClaudeP(prompt, cwd) {
   const claudeBin = fs.existsSync('/workspace/.local/bin/claude') ? '/workspace/.local/bin/claude' : 'claude';
   return new Promise((resolve, reject) => {
+    // detached: the child leads its own process group, so killTree() below can
+    // signal the WHOLE subtree. `claude` spawns its own children (bash tool
+    // calls, MCP servers, test runners); SIGKILLing only the direct child left
+    // those orphaned forever, and with node as the container's PID 1 -- which
+    // never reaps -- each one became a permanent zombie holding a pid slot.
     const child = spawn(claudeBin, ['-p', '--dangerously-skip-permissions'], {
       cwd,
       env: agentEnv(),
+      detached: true,
     });
+    const killTree = () => {
+      try { process.kill(-child.pid, 'SIGKILL'); }
+      catch (_) { try { child.kill('SIGKILL'); } catch (_) {} }
+    };
     let out = '', err = '';
     const MAX = 64 * 1024 * 1024;
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} reject(new Error('claude -p timed out (20m)')); }, 20 * 60 * 1000);
+    const timer = setTimeout(() => { killTree(); reject(new Error('claude -p timed out (20m)')); }, 20 * 60 * 1000);
     child.stdout.on('data', (d) => { out += d; if (out.length > MAX) out = out.slice(-MAX); });
     child.stderr.on('data', (d) => { err += d; if (err.length > MAX) err = err.slice(-MAX); });
-    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('error', (e) => { clearTimeout(timer); killTree(); reject(e); });
     child.on('close', (code) => {
       clearTimeout(timer);
+      killTree(); // sweep anything `claude` left behind in its group
       if (code === 0) return resolve(out);
       const e = new Error(`claude -p exited with code ${code}`); e.stdout = out; e.stderr = err; reject(e);
     });
@@ -1745,11 +1756,14 @@ wss.on('connection', (ws, req) => {
         }
       }
 
-      if (TMUX_SESSION) {
-        // Preserve tmux session on disconnect
-      } else {
-        try { if (connection.ptyProcess) connection.ptyProcess.kill(); } catch (error) {}
-      }
+      // Always kill the pty. Under tmux the pty is only an `attach-session`
+      // CLIENT -- the session itself is owned by the detached tmux server, so
+      // killing the client is exactly a detach and the session survives.
+      // Skipping it leaked one process + one pty per disconnect (tab close,
+      // mobile reconnect, network flap); 152 of them accumulated over five
+      // weeks and exhausted the container's pids cgroup, after which every
+      // fork() -- new ptys, tmux, even host sshd sessions -- failed EAGAIN.
+      try { if (connection.ptyProcess) connection.ptyProcess.kill(); } catch (error) {}
       connections.delete(id);
     }
   }

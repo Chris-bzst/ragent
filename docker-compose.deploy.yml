@@ -1,0 +1,47 @@
+# Production compose for the Lighthouse box (/opt/ragent/docker-compose.deploy.yml).
+# Kept in the repo so the live topology -- Traefik routing, watchtower scope,
+# resource ceilings -- is reviewable and reproducible instead of existing only
+# on one server's disk.
+services:
+  ragent:
+    image: ghcr.io/chris-bzst/ragent:latest
+    container_name: ragent
+    env_file: .env
+    volumes:
+      - /opt/ragent-data/workspace:/workspace
+    restart: unless-stopped
+    mem_limit: 2g
+    # tini as PID 1: node does not reap orphans, so without this every
+    # subprocess an agent orphans becomes a permanent zombie holding a pid slot.
+    init: true
+    # Was 512, which the leaks below filled to 503/512 and wedged fork().
+    pids_limit: 2048
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ragent.rule=Host(`ragent.useai.club`)"
+      - "traefik.http.routers.ragent.entrypoints=websecure"
+      - "traefik.http.routers.ragent.tls.certresolver=letsencrypt"
+      - "traefik.http.services.ragent.loadbalancer.server.port=3001"
+      # Watchtower 只自动更新带这个标签的容器(= 只有 ragent,Hyrika 不带 → 永不碰)
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: ragent-watchtower
+    restart: unless-stopped
+    mem_limit: 128m
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/ubuntu/.docker/config.json:/config.json:ro   # GHCR 拉取凭据
+    environment:
+      - WATCHTOWER_LABEL_ENABLE=true    # 只看带 enable 标签的容器
+      - WATCHTOWER_POLL_INTERVAL=60     # 每 60s 查一次 GHCR
+      - WATCHTOWER_CLEANUP=true         # 更新后清理旧镜像
+      - DOCKER_API_VERSION=1.44
+
+networks:
+  proxy:
+    name: hyrika-platform_traefik-public
+    external: true
