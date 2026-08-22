@@ -12,6 +12,24 @@ const SessionStore = require('./utils/session-store');
 
 // Agent SDK — lazy-loaded since it's an optional ESM module
 let claudeQuery = null;
+// UNWIRED as of 2026-08-22 -- this import cannot succeed here, so every caller
+// of getClaudeQuery() throws. Three independent reasons, any one of them fatal:
+//
+//   1. `@anthropic-ai/claude-code` is not in backend/package.json, so it is
+//      never installed into /app/backend/node_modules.
+//   2. The entrypoint's `npm install -g` copy lands in the image's global
+//      prefix, which is not on node's resolution path and NODE_PATH is unset.
+//      Verified in the container: ERR_MODULE_NOT_FOUND.
+//   3. That package exports nothing anyway -- it is the CLI launcher (its
+//      package.json has no `main`/`exports`; `files` is just the binary plus
+//      install scripts). The library is a DIFFERENT package,
+//      `@anthropic-ai/claude-agent-sdk`.
+//
+// Nothing reaches this code either: the chat path below is only entered from a
+// `type: 'chat'` websocket message, and the frontend never sends one (`grep -i
+// chat frontend/` is empty). Left in place rather than deleted so the intent
+// survives; wiring it up means depending on the agent SDK package and building
+// a client for it, which is a feature, not a fix.
 async function getClaudeQuery() {
   if (!claudeQuery) {
     try {
@@ -25,7 +43,9 @@ async function getClaudeQuery() {
   return claudeQuery;
 }
 
-// Track active chat abort controllers per session
+// Track active chat abort controllers per session.
+// Always empty in practice -- only handleChatMessage() writes to it, and that
+// function is unreachable (see getClaudeQuery above).
 const activeChatAborts = new Map();
 
 // Shell path escaping to prevent command injection
@@ -1496,6 +1516,10 @@ server.on('upgrade', (req, socket, head) => {
 
 // ==================== Agent SDK Chat Handler ====================
 
+// UNREACHABLE -- see the note on getClaudeQuery(). Entered only via a
+// `type: 'chat'` websocket message that no client sends, and it would throw at
+// the `await getClaudeQuery()` below even if one did. Not a leak path: it never
+// spawns anything.
 async function handleChatMessage(ws, clientId, msg) {
   const { sessionId, prompt } = msg;
   if (!sessionId || !prompt) {
@@ -1728,6 +1752,9 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({ type: 'pong' }));
           }
           break;
+        // The two 'chat' cases below are dead: no client sends these message
+        // types, and handleChatMessage is unreachable regardless (see its
+        // definition).
         case 'chat':
           handleChatMessage(ws, clientId, parsed);
           break;
